@@ -1,0 +1,20 @@
+<!doctype html>
+<html><head><meta charset="utf-8">
+<style>
+  html, body { margin: 0; padding: 0; background: #ffffff; }
+  body { padding: 20px; font-family: "Segoe UI", Arial, sans-serif; }
+</style>
+<script src="mermaid.min.js"></script>
+</head><body>
+<pre class="mermaid">graph LR
+  A[Codex CLI session] -->|append events| B[(rollout-*.jsonl)]
+  B -->|tail and poll| C[Normalizer]
+  C --> D[(event journal JSONL)]
+  C --> E[Graph model: nodes plus parent_id edges]
+  E --> F[2D lanes renderer]
+  E --> G[3D force renderer]
+  D --> H[Snapshots, GraphML, GEXF]
+  F -. WebSocket .-> I((Browser))
+  G -. WebSocket .-> I</pre>
+<script>mermaid.initialize({ startOnLoad: true, theme: "default" });</script>
+</body></html>

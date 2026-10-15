@@ -1,0 +1,10 @@
+sequenceDiagram
+  participant C as Codex CLI
+  participant F as rollout JSONL
+  participant S as GRAFF server
+  participant B as Browser
+  C->>F: append event
+  S->>F: tail and poll
+  S->>S: normalize and attach parent_id
+  S-->>B: WebSocket push
+  B->>B: render new node

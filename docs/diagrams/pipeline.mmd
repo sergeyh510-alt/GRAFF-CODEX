@@ -1,0 +1,10 @@
+graph LR
+  A[Codex CLI session] -->|append events| B[(rollout-*.jsonl)]
+  B -->|tail and poll| C[Normalizer]
+  C --> D[(event journal JSONL)]
+  C --> E[Graph model: nodes plus parent_id edges]
+  E --> F[2D lanes renderer]
+  E --> G[3D force renderer]
+  D --> H[Snapshots, GraphML, GEXF]
+  F -. WebSocket .-> I((Browser))
+  G -. WebSocket .-> I

@@ -1,0 +1,291 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>GRAFF · живой граф рассуждений Codex</title>
+<link rel="stylesheet" href="/static/css/styles.css" />
+</head>
+<body>
+<div class="app">
+
+  <header class="topbar">
+    <div class="brand">
+      <span class="logo">◈</span>
+      <div class="brand-text">
+        <h1>GRAFF</h1>
+        <span class="tagline">живой граф рассуждений и действий Codex</span>
+      </div>
+    </div>
+
+    <div class="mode-tabs" id="mode-tabs" role="tablist" aria-label="Режим визуализации">
+      <button class="mode-tab" data-mode="2d" role="tab">2D-дорожки</button>
+      <button class="mode-tab" data-mode="3d" role="tab">3D · нейронный мозг</button>
+    </div>
+
+    <div class="session-info">
+      <span id="session-name" class="session-name" title="Активная сессия">—</span>
+      <span class="dot" id="conn-dot" data-state="offline"></span>
+      <span id="conn-label" class="conn-label">подключение…</span>
+    </div>
+
+    <div class="topstats">
+      <div class="stat"><span class="stat-value" id="stat-events">0</span><span class="stat-label">событий</span></div>
+      <div class="stat"><span class="stat-value" id="stat-nodes">0</span><span class="stat-label">узлов</span></div>
+      <div class="stat"><span class="stat-value" id="stat-lines">0</span><span class="stat-label">строк</span></div>
+      <div class="stat"><span class="stat-value" id="stat-errors">0</span><span class="stat-label">сбоев парсера</span></div>
+      <div class="stat"><span class="stat-value" id="stat-uptime">00:00</span><span class="stat-label">в работе</span></div>
+    </div>
+  </header>
+
+  <aside class="sidebar" id="sidebar">
+
+    <section class="panel">
+      <h2>Легенда</h2>
+      <p class="hint">Цвет и форма узла кодируют тип события.</p>
+      <ul class="legend" id="legend"></ul>
+      <ul class="legend legend-modes">
+        <li><span class="swatch" style="background:#3ddc84"></span><span class="lname">начало цепочки (3D)</span></li>
+        <li><span class="swatch" style="background:#ffce38"></span><span class="lname">конец цепочки (3D)</span></li>
+        <li><span class="swatch" data-shift="true"></span><span class="lname">сдвиг узла вдоль дорожки (2D)</span></li>
+      </ul>
+    </section>
+
+    <section class="panel">
+      <h2>Поиск</h2>
+      <input type="search" id="search-box" class="search-input" placeholder="поиск по тексту узлов…" autocomplete="off" />
+      <div class="search-result hint" id="search-result"></div>
+    </section>
+
+    <section class="panel">
+      <h2>Фильтры по типам</h2>
+      <div class="filters" id="type-filters"></div>
+      <label class="field">
+        <span>Окно времени</span>
+        <div class="range-row">
+          <input type="range" id="time-window" min="0" max="60" step="1" value="0" />
+          <output id="time-window-value">всё</output>
+        </div>
+      </label>
+      <label class="switch">
+        <input type="checkbox" id="filter-actors" />
+        <span>Скрыть сообщения пользователя</span>
+      </label>
+    </section>
+
+    <section class="panel" id="panel-layout">
+      <h2>Раскладка</h2>
+      <select id="layout-mode" class="select">
+        <option value="lanes" selected>Дорожки: время × тип (2D)</option>
+        <option value="hier-lr">Иерархия, слева → направо</option>
+        <option value="hier-ud">Иерархия, сверху → вниз</option>
+        <option value="physics">Физика (свободная укладка)</option>
+      </select>
+      <p class="hint">
+        Дорожки: по горизонтали — время события, по вертикали — тип
+        (reason / message / tool_call / tool_result / file_edit / error).
+      </p>
+      <label class="switch">
+        <input type="checkbox" id="node-size" checked />
+        <span>Размер узла по типу события</span>
+      </label>
+      <label class="switch">
+        <input type="checkbox" id="color-edges" checked />
+        <span>Цвет рёбер по связи</span>
+      </label>
+      <label class="switch">
+        <input type="checkbox" id="collapse-chains" />
+        <span>Свёртка цепочек tool_call → tool_result</span>
+      </label>
+      <label class="switch">
+        <input type="checkbox" id="follow" checked />
+        <span>Следовать за новыми узлами</span>
+      </label>
+      <label class="switch">
+        <input type="checkbox" id="show-labels" checked />
+        <span>Подписи узлов</span>
+      </label>
+      <label class="switch">
+        <input type="checkbox" id="auto-lanes" checked />
+        <span>Авто-дорожки для вырожденных сессий</span>
+      </label>
+      <label class="switch">
+        <input type="checkbox" id="perf-mode" checked />
+        <span>Режим производительности (спрайты/тултипы выключены)</span>
+      </label>
+      <div class="button-row">
+        <button id="btn-fit" class="btn">Уместить всё</button>
+        <button id="btn-latest" class="btn">К последнему</button>
+        <button id="btn-reset-shifts" class="btn" title="Вернуть все узлы дорожек на исходные места">Сбросить сдвиги</button>
+      </div>
+      <p class="hint" id="perf-note"></p>
+      <p class="hint" id="layout-note"></p>
+    </section>
+
+    <section class="panel" id="panel-3d">
+      <h2>3D · нейронный мозг</h2>
+      <p class="hint">
+        Цвет по времени (холодный синий → тёплый оранжевый), размер/яркость по
+        типу (ошибки крупнее всех). Камера плавно вращается через
+        <code>controls().autoRotate</code>. Связи по умолчанию — быстрые линии
+        (общий <code>LineSegments</code>, один draw call); толстые и изогнутые
+        связи — только для малых графов.
+      </p>
+      <div class="button-row">
+        <button id="btn-rotate" class="btn">Пауза вращения</button>
+        <button id="btn-fit3d" class="btn">Уместить всё</button>
+      </div>
+      <label class="switch">
+        <input type="checkbox" id="gl-thick-links" />
+        <span>Толстые связи (цилиндры — дорого, только малые графы)</span>
+      </label>
+      <label class="switch">
+        <input type="checkbox" id="gl-curved-links" />
+        <span>Изогнутые связи + стрелки (только малые графы)</span>
+      </label>
+      <label class="switch">
+        <input type="checkbox" id="gl-markers" checked />
+        <span>Метки начала (зелёная) и конца (жёлтая) цепочки</span>
+      </label>
+      <div class="diag" id="gl-diagnostics">
+        <div class="diag-row"><span class="diag-key">режим</span><span class="diag-val" id="gl-mode">—</span></div>
+        <div class="diag-row"><span class="diag-key">раскладка</span><span class="diag-val" id="gl-layout">—</span></div>
+        <div class="diag-row"><span class="diag-key">физика</span><span class="diag-val" id="gl-physics">—</span></div>
+        <div class="diag-row"><span class="diag-key">FPS</span><span class="diag-val" id="gl-fps">—</span></div>
+        <div class="diag-row"><span class="diag-key">кадр</span><span class="diag-val" id="gl-frame">—</span></div>
+        <div class="diag-row"><span class="diag-key">узлов / связей</span><span class="diag-val" id="gl-counts">—</span></div>
+        <div class="diag-row"><span class="diag-key">draw calls</span><span class="diag-val" id="gl-calls">—</span></div>
+        <div class="diag-row"><span class="diag-key">треугольников</span><span class="diag-val" id="gl-tris">—</span></div>
+      </div>
+      <p class="hint" id="gl-limit"></p>
+      <p class="hint" id="gl-status"></p>
+    </section>
+
+    <section class="panel">
+      <h2>Сессия</h2>
+      <select id="session-select" class="select"></select>
+      <div class="button-row">
+        <button id="btn-open" class="btn btn-primary">Открыть</button>
+        <button id="btn-refresh" class="btn">Обновить</button>
+      </div>
+      <label class="switch">
+        <input type="checkbox" id="follow-sessions" checked />
+        <span>Следить за новыми сессиями (авто-переключение)</span>
+      </label>
+      <p class="hint" id="session-path" title=""></p>
+      <p class="hint" id="session-log"></p>
+    </section>
+
+    <section class="panel">
+      <h2>ИИ-обогащение рассуждений</h2>
+      <p class="hint">
+        Добавляет узлы <b>reason</b>: короткое резюме шага через
+        OpenAI-совместимый эндпоинт. Ключ только из окружения
+        (<code>ROUTERAI_API_KEY</code>/<code>AITUNNEL_API_KEY</code>).
+      </p>
+      <div class="button-row">
+        <button id="btn-enrich" class="btn">Суммаризировать (ИИ)</button>
+      </div>
+      <div class="range-row">
+        <label class="hint" for="ai-limit">лимит запросов</label>
+        <input type="number" id="ai-limit" class="num-input" min="1" max="500" value="40" />
+      </div>
+      <p class="hint" id="ai-status"></p>
+    </section>
+
+    <section class="panel">
+      <h2>Сохранить</h2>
+      <p class="hint">Перезагружаемая структура, а не картинка.</p>
+      <div class="button-row">
+        <button id="btn-save-json" class="btn">Снапшот JSON</button>
+        <button id="btn-save-graphml" class="btn">GraphML</button>
+        <button id="btn-save-gexf" class="btn">GEXF</button>
+        <button id="btn-save-png" class="btn btn-primary">PNG</button>
+      </div>
+      <p class="hint" id="export-status"></p>
+    </section>
+
+  </aside>
+
+  <main class="stage">
+    <div class="stage-canvas" id="stage-canvas"></div>
+    <div class="stage-gl" id="gl3d" hidden></div>
+
+    <div class="empty" id="graph-empty" hidden>
+      <div class="empty-card">
+        <span class="empty-icon">◈</span>
+        <h3 id="empty-title">Мало событий в этой сессии</h3>
+        <p id="empty-text">
+          В выбранной сессии меньше двух узлов — показывать почти нечего.
+          Выберите другую сессию из списка ниже.
+        </p>
+        <div class="empty-sessions" id="empty-sessions"></div>
+        <p class="hint" id="empty-hint"></p>
+      </div>
+    </div>
+
+    <div class="empty" id="graph-waiting">
+      <div class="empty-card">
+        <span class="empty-icon">◈</span>
+        <h3>Ждём события</h3>
+        <p>Слушаем роллаут-сессию Codex. Как только появятся рассуждения и вызовы инструментов, они появятся в графе.</p>
+      </div>
+    </div>
+
+    <div class="missing-vis" id="missing-vis" hidden>
+      <div class="empty-card missing-vis-card">
+        <h3>Библиотека графа не загрузилась</h3>
+        <p>Не удалось загрузить vis-network. Подробности ниже — какой адрес
+           пробовали и что ответил сервер.</p>
+        <pre class="missing-vis-log" id="missing-vis-log"></pre>
+        <p class="hint">Локальная копия: <code>static/vendor/vis-network.min.js</code>.
+           Перекачать: <code>python scripts/fetch_vis.py</code></p>
+        <div class="button-row">
+          <button id="missing-vis-retry" class="btn btn-primary">Попробовать снова</button>
+        </div>
+      </div>
+    </div>
+
+    <div class="missing-vis" id="missing-3d" hidden>
+      <div class="empty-card missing-vis-card">
+        <h3>3D-библиотека не загрузилась</h3>
+        <p>Не удалось загрузить <code>three.js</code> / <code>3d-force-graph</code>.
+           Подробности ниже.</p>
+        <pre class="missing-vis-log" id="missing-3d-log"></pre>
+        <p class="hint">Локальные копии: <code>static/vendor/three.min.js</code>,
+           <code>static/vendor/3d-force-graph.min.js</code></p>
+        <div class="button-row">
+          <button id="missing-3d-retry" class="btn btn-primary">Попробовать снова</button>
+          <button id="missing-3d-to2d" class="btn">Вернуться в 2D</button>
+        </div>
+      </div>
+    </div>
+
+    <svg class="minimap" id="minimap" aria-hidden="true"></svg>
+  </main>
+
+  <aside class="details" id="details" data-open="false">
+    <button class="details-close" id="details-close" title="Закрыть">×</button>
+    <div class="details-head">
+      <span class="badge" id="details-type">—</span>
+      <span class="details-actor" id="details-actor"></span>
+      <span class="details-time" id="details-time"></span>
+    </div>
+    <h3 id="details-title">Выберите узел</h3>
+    <div class="details-meta" id="details-meta"></div>
+    <div class="details-path" id="details-path"></div>
+    <pre class="details-text" id="details-text">Кликните по узлу графа, чтобы увидеть полный текст события и подсветить путь.</pre>
+    <div class="button-row">
+      <button class="btn" id="btn-copy">Скопировать текст</button>
+      <button class="btn btn-danger" id="btn-delete" title="Скрыть узел (и потомков) из графа">Скрыть узел</button>
+    </div>
+  </aside>
+
+</div>
+
+<!-- boot.js loads vis-network first (local copy, then CDN) and starts app.js
+     only after the library finished loading; the 3D libraries are loaded
+     lazily the same way when the 3D mode is opened. -->
+<script src="/static/js/boot.js"></script>
+</body>
+</html>

@@ -1,0 +1,15 @@
+flowchart LR
+  R[raw rollout record] --> T{payload type}
+  T -->|message| M[message]
+  T -->|function_call| C[tool_call]
+  T -->|function_call_output| O[tool_result]
+  T -->|patch or file write| P[file_edit]
+  T -->|error| X[error]
+  T -->|reasoning| N[reason]
+  M --> S[(event with ts, type, text)]
+  C --> S
+  O --> S
+  P --> S
+  X --> S
+  N --> S
+  S --> E[edge: parent_id to child]

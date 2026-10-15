@@ -1,0 +1,32 @@
+# virtual environment
+.venv/
+env/
+venv/
+
+# python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+
+# GRAFF runtime output (event journal, snapshots, exports, demo sessions)
+runtime/
+
+# scratch / tooling
+.tmp/
+.work/
+
+# build output (PyInstaller)
+build/
+dist/
+*.spec.bak
+
+# editors / OS
+.idea/
+.vscode/
+Thumbs.db
+Desktop.ini
+
+# logs and temporary render output
+*.log
+docs/diagrams/*.render.html

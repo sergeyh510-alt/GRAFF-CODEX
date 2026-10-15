@@ -1,0 +1,481 @@
+/* GRAFF — dark, high-contrast theme for the live reasoning graph. */
+:root {
+  --bg: #0a0e14;
+  --bg-soft: #0f141d;
+  --panel: #121a25;
+  --panel-2: #172130;
+  --elevated: #1d2836;
+  --border: #26313f;
+  --border-strong: #33414f;
+  --text: #e6edf3;
+  --muted: #8ba0b4;
+  --muted-dim: #64748b;
+  --accent: #4d8bf0;
+  --accent-soft: #1e3a63;
+
+  --t-reason: #94a3b8;
+  --t-message: #cbd5e1;
+  --t-tool-call: #3b82f6;
+  --t-tool-result: #2dd4bf;
+  --t-file-edit: #f59e0b;
+  --t-error: #ef4444;
+  --t-user: #a78bfa;
+
+  --shadow: 0 18px 40px rgba(0, 0, 0, 0.45);
+  --radius: 14px;
+}
+
+* { box-sizing: border-box; }
+
+/* The [hidden] attribute must always win, even when a component rule sets its
+   own display (e.g. .missing-vis / .empty use display: grid). Without this the
+   author "display" overrides the UA default and hidden elements stay visible. */
+[hidden] { display: none !important; }
+
+html, body {
+  margin: 0;
+  height: 100%;
+  background: radial-gradient(1200px 800px at 12% -10%, #16233a 0%, var(--bg) 55%) fixed;
+  color: var(--text);
+  font-family: "Segoe UI", "Inter", system-ui, -apple-system, sans-serif;
+  font-size: 14px;
+  overflow: hidden;
+}
+
+code {
+  font-family: "Cascadia Code", "JetBrains Mono", Consolas, monospace;
+  background: #0c1420;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 1px 6px;
+  color: #9fd0ff;
+  font-size: 12px;
+}
+
+.app {
+  display: grid;
+  height: 100vh;
+  grid-template-columns: 300px 1fr;
+  grid-template-rows: 62px 1fr;
+  grid-template-areas:
+    "topbar topbar"
+    "sidebar stage";
+}
+
+/* ---------------- top bar ---------------- */
+.topbar {
+  grid-area: topbar;
+  display: flex;
+  align-items: center;
+  gap: 22px;
+  padding: 0 20px;
+  background: linear-gradient(180deg, rgba(23, 33, 48, 0.96), rgba(15, 20, 29, 0.92));
+  border-bottom: 1px solid var(--border);
+  backdrop-filter: blur(8px);
+  z-index: 5;
+}
+
+.brand { display: flex; align-items: center; gap: 12px; }
+.logo {
+  font-size: 26px;
+  color: var(--accent);
+  text-shadow: 0 0 18px rgba(77, 139, 240, 0.65);
+}
+.brand-text h1 {
+  margin: 0;
+  font-size: 19px;
+  letter-spacing: 3px;
+  font-weight: 600;
+  background: linear-gradient(90deg, #cfe2ff, #6fa8ff);
+  -webkit-background-clip: text;
+  background-clip: text;
+  color: transparent;
+}
+.tagline { font-size: 11px; color: var(--muted-dim); letter-spacing: 0.3px; }
+
+.session-info { display: flex; align-items: center; gap: 8px; margin-left: auto; }
+.session-name {
+  max-width: 340px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 12px;
+  color: var(--muted);
+  font-family: "Cascadia Code", Consolas, monospace;
+}
+.dot { width: 9px; height: 9px; border-radius: 50%; background: #ef4444; box-shadow: 0 0 10px currentColor; }
+.dot[data-state="online"] { background: #22c55e; animation: pulse 2s infinite; }
+.dot[data-state="waiting"] { background: #f59e0b; }
+@keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: 0.4; } }
+.conn-label { font-size: 11px; color: var(--muted-dim); }
+
+.topstats { display: flex; gap: 18px; margin-left: auto; }
+.stat { display: flex; flex-direction: column; align-items: flex-end; min-width: 58px; }
+.stat-value { font-size: 17px; font-weight: 600; font-variant-numeric: tabular-nums; }
+.stat-label { font-size: 10px; color: var(--muted-dim); text-transform: uppercase; letter-spacing: 0.6px; }
+
+/* ---------------- sidebar ---------------- */
+.sidebar {
+  grid-area: sidebar;
+  overflow-y: auto;
+  padding: 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  background: linear-gradient(180deg, rgba(18, 26, 37, 0.75), rgba(10, 14, 20, 0.85));
+  border-right: 1px solid var(--border);
+}
+
+.panel {
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 14px;
+  box-shadow: 0 6px 18px rgba(0, 0, 0, 0.25);
+}
+.panel h2 {
+  margin: 0 0 10px;
+  font-size: 12px;
+  text-transform: uppercase;
+  letter-spacing: 1.2px;
+  color: var(--muted);
+  font-weight: 600;
+}
+.hint { margin: 6px 0 0; font-size: 11px; color: var(--muted-dim); line-height: 1.5; }
+
+.legend { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 7px; }
+.legend li { display: flex; align-items: center; gap: 9px; font-size: 12.5px; cursor: pointer; opacity: 0.95; }
+.legend li[data-off="true"] { opacity: 0.35; }
+.legend .swatch { width: 15px; height: 15px; border-radius: 50%; flex: none; box-shadow: 0 0 10px -2px currentColor; }
+.legend .swatch.box { border-radius: 4px; }
+.legend .swatch.diamond { border-radius: 3px; transform: rotate(45deg); width: 12px; height: 12px; }
+.legend .lname { flex: 1; }
+.legend-modes { margin-top: 12px; border-top: 1px dashed var(--border); padding-top: 10px; }
+.legend-modes li { cursor: default; }
+/* outlined swatch for the "shifted lane node" legend entry */
+.legend .swatch[data-shift] { background: transparent; border: 2.5px solid #7dd3fc; border-radius: 50%; box-shadow: 0 0 10px -2px #7dd3fc; }
+
+.counters { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 12px; }
+.counters .chip {
+  font-size: 11px;
+  padding: 3px 8px;
+  border-radius: 20px;
+  background: var(--panel-2);
+  border: 1px solid var(--border);
+  color: var(--muted);
+  font-variant-numeric: tabular-nums;
+}
+
+.filters { display: flex; flex-wrap: wrap; gap: 7px; }
+.filters .flt {
+  font-size: 11.5px;
+  padding: 5px 10px;
+  border-radius: 20px;
+  border: 1px solid var(--border-strong);
+  background: var(--panel-2);
+  color: var(--muted);
+  cursor: pointer;
+  transition: all 0.12s ease;
+  user-select: none;
+}
+.filters .flt[data-on="true"] { color: #fff; border-color: currentColor; box-shadow: 0 0 12px -4px currentColor; }
+
+.field { display: block; margin-top: 12px; font-size: 12px; color: var(--muted); }
+.field span { display: block; margin-bottom: 6px; }
+.range-row { display: flex; align-items: center; gap: 10px; }
+input[type="range"] { flex: 1; accent-color: var(--accent); }
+output { font-size: 12px; color: var(--text); min-width: 46px; text-align: right; font-variant-numeric: tabular-nums; }
+
+.switch { display: flex; align-items: center; gap: 9px; margin-top: 9px; font-size: 12.5px; color: var(--muted); cursor: pointer; }
+.switch input { accent-color: var(--accent); width: 15px; height: 15px; }
+
+.button-row { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 12px; }
+.btn {
+  flex: 1;
+  min-width: 96px;
+  padding: 8px 10px;
+  border-radius: 9px;
+  border: 1px solid var(--border-strong);
+  background: var(--panel-2);
+  color: var(--text);
+  font-size: 12px;
+  cursor: pointer;
+  transition: all 0.12s ease;
+}
+.btn:hover { background: var(--elevated); border-color: var(--accent); }
+.btn:active { transform: translateY(1px); }
+.btn-primary { background: linear-gradient(180deg, #2f6fd6, #245bb0); border-color: #3f7fe0; }
+
+.select {
+  width: 100%;
+  padding: 8px 10px;
+  border-radius: 9px;
+  background: var(--panel-2);
+  border: 1px solid var(--border-strong);
+  color: var(--text);
+  font-size: 12px;
+}
+.select option { background: var(--panel); }
+
+/* ---------------- stage ---------------- */
+.stage { grid-area: stage; position: relative; }
+#graph { position: absolute; inset: 0; }
+
+.empty { position: absolute; inset: 0; display: grid; place-items: center; pointer-events: none; }
+.empty[hidden] { display: none; }
+.empty-card {
+  text-align: center;
+  max-width: 420px;
+  padding: 26px 30px;
+  border-radius: 18px;
+  background: rgba(18, 26, 37, 0.72);
+  border: 1px solid var(--border);
+  backdrop-filter: blur(3px);
+}
+.empty-icon { font-size: 40px; color: var(--accent); display: block; margin-bottom: 8px; }
+.empty-card h3 { margin: 0 0 8px; font-size: 17px; }
+.empty-card p { margin: 0 0 8px; color: var(--muted); font-size: 13px; line-height: 1.6; }
+
+.missing-vis { position: absolute; inset: 0; display: grid; place-items: center; background: rgba(10, 14, 20, 0.92); z-index: 20; }
+.missing-vis[hidden] { display: none; }
+
+/* diagnostic block shown when vis-network could not be loaded */
+.missing-vis-card { max-width: 640px; }
+.missing-vis-log {
+  margin: 10px 0;
+  padding: 10px 12px;
+  background: #0b0f16;
+  border: 1px solid var(--border, #263243);
+  border-radius: 8px;
+  color: #cbd5e1;
+  font: 12px/1.6 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  white-space: pre-wrap;
+  word-break: break-word;
+  text-align: left;
+  max-height: 220px;
+  overflow: auto;
+}
+
+.minimap {
+  position: absolute;
+  right: 16px;
+  bottom: 16px;
+  width: 200px;
+  height: 130px;
+  border-radius: 10px;
+  background: rgba(10, 14, 20, 0.7);
+  border: 1px solid var(--border);
+  pointer-events: none;
+}
+.minimap rect { fill: var(--muted-dim); }
+
+/* ---------------- details drawer ---------------- */
+.details {
+  position: fixed;
+  top: 62px;
+  right: 0;
+  bottom: 0;
+  width: 440px;
+  max-width: 46vw;
+  background: linear-gradient(180deg, rgba(23, 33, 48, 0.98), rgba(13, 19, 28, 0.99));
+  border-left: 1px solid var(--border-strong);
+  box-shadow: var(--shadow);
+  transform: translateX(105%);
+  transition: transform 0.22s cubic-bezier(0.4, 0, 0.2, 1);
+  display: flex;
+  flex-direction: column;
+  padding: 18px;
+  gap: 12px;
+  z-index: 15;
+}
+.details[data-open="true"] { transform: translateX(0); }
+
+.details-close {
+  position: absolute;
+  top: 12px;
+  right: 12px;
+  width: 30px;
+  height: 30px;
+  border-radius: 8px;
+  border: 1px solid var(--border);
+  background: var(--panel-2);
+  color: var(--muted);
+  font-size: 18px;
+  line-height: 1;
+  cursor: pointer;
+}
+.details-close:hover { color: #fff; border-color: var(--accent); }
+
+.details-head { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+.badge {
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.8px;
+  padding: 3px 10px;
+  border-radius: 20px;
+  background: var(--panel-2);
+  border: 1px solid currentColor;
+  font-weight: 600;
+}
+.details-actor, .details-time { font-size: 11px; color: var(--muted-dim); font-family: "Cascadia Code", Consolas, monospace; }
+.details h3 { margin: 0; font-size: 15px; line-height: 1.45; word-break: break-word; }
+.details-meta { display: flex; flex-wrap: wrap; gap: 6px; }
+.details-meta .chip { font-size: 11px; padding: 3px 8px; border-radius: 6px; background: var(--panel-2); border: 1px solid var(--border); color: var(--muted); }
+.details-text {
+  flex: 1;
+  margin: 0;
+  overflow: auto;
+  white-space: pre-wrap;
+  word-break: break-word;
+  background: #0b1119;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 12px;
+  font-family: "Cascadia Code", "JetBrains Mono", Consolas, monospace;
+  font-size: 12px;
+  line-height: 1.55;
+  color: #cdd9e5;
+}
+
+.sidebar::-webkit-scrollbar, .details-text::-webkit-scrollbar, .sidebar::-webkit-scrollbar { width: 9px; }
+.sidebar::-webkit-scrollbar-thumb, .details-text::-webkit-scrollbar-thumb { background: #2b3849; border-radius: 6px; }
+.sidebar::-webkit-scrollbar-track, .details-text::-webkit-scrollbar-track { background: transparent; }
+
+.toast {
+  position: fixed;
+  bottom: 22px;
+  left: 50%;
+  transform: translateX(-50%) translateY(20px);
+  background: var(--elevated);
+  border: 1px solid var(--border-strong);
+  color: var(--text);
+  padding: 10px 18px;
+  border-radius: 10px;
+  font-size: 12.5px;
+  opacity: 0;
+  transition: all 0.2s ease;
+  z-index: 40;
+  box-shadow: var(--shadow);
+}
+.toast[data-show="true"] { opacity: 1; transform: translateX(-50%) translateY(0); }
+
+/* ------------------------------------------------------------------ */
+/* GRAFF 0.2 additions                                                 */
+/* ------------------------------------------------------------------ */
+
+.search-input, .num-input {
+  width: 100%;
+  padding: 8px 10px;
+  border-radius: 9px;
+  background: var(--panel-2);
+  border: 1px solid var(--border-strong);
+  color: var(--text);
+  font-size: 12.5px;
+  outline: none;
+}
+.search-input:focus, .num-input:focus { border-color: var(--accent); box-shadow: 0 0 0 2px rgba(77,139,240,0.18); }
+.num-input { width: 74px; text-align: center; }
+.search-result { min-height: 16px; }
+
+.counters .chip[data-type] { border-left-width: 3px; }
+
+.filters .flt[data-on="false"] { opacity: 0.4; }
+
+.btn-danger { border-color: #7f3030; }
+.btn-danger:hover { background: #3a1d1d; border-color: #ef4444; }
+
+/* details: path highlighting block */
+.details-path { font-size: 11.5px; color: var(--muted); }
+.path-label { color: var(--muted-dim); text-transform: uppercase; letter-spacing: 0.5px; font-size: 10px; }
+.path-chain { margin-top: 6px; display: flex; flex-wrap: wrap; align-items: center; gap: 4px; }
+.path-chip {
+  background: var(--panel-2);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 2px 6px;
+  color: var(--muted);
+  font-family: "Cascadia Code", Consolas, monospace;
+  font-size: 10.5px;
+  max-width: 160px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.path-chip.current { border-color: var(--accent); color: #cfe2ff; }
+
+/* empty state with quick session buttons */
+.empty-sessions { display: flex; flex-direction: column; gap: 6px; margin: 12px 0; }
+.empty-card { pointer-events: auto; }
+.session-quick {
+  flex: none;
+  width: 100%;
+  text-align: left;
+  font-size: 12px;
+}
+
+/* keep the empty overlay below the details drawer but above the canvas */
+.empty { z-index: 8; }
+.details { z-index: 15; }
+
+/* ------------------------------------------------------------------ */
+/* GRAFF 0.3 — view modes: 2D lanes, 3D brain                           */
+/* ------------------------------------------------------------------ */
+
+/* mode tabs in the top bar */
+.mode-tabs { display: flex; gap: 6px; margin-left: 6px; }
+.mode-tab {
+  padding: 7px 13px;
+  border-radius: 9px;
+  border: 1px solid var(--border-strong);
+  background: var(--panel-2);
+  color: var(--muted);
+  font-size: 12px;
+  cursor: pointer;
+  white-space: nowrap;
+  transition: all 0.12s ease;
+}
+.mode-tab:hover { color: #fff; border-color: var(--accent); }
+.mode-tab[data-active="true"] {
+  color: #fff;
+  border-color: var(--accent);
+  background: linear-gradient(180deg, #2f6fd6, #245bb0);
+  box-shadow: 0 0 14px -4px var(--accent);
+}
+
+/* the stage now holds two stacked layers: 2D canvas + WebGL canvas */
+.stage-canvas { position: absolute; inset: 0; }
+.stage-canvas[hidden] { display: none; }
+.stage-gl { position: absolute; inset: 0; background: #04070c; }
+.stage-gl[hidden] { display: none; }
+.stage-gl canvas { display: block; }
+
+.minimap[hidden] { display: none !important; }
+
+/* subtle hint shown in the sidebar when the lanes layout is auto-selected */
+#layout-note { color: #7fb0e8; }
+
+/* ------------------------------------------------------------------ */
+/* performance mode + activity log                                     */
+/* ------------------------------------------------------------------ */
+/* 3D diagnostics panel: FPS, counts, draw calls, triangles */
+.diag {
+  margin-top: 10px;
+  border: 1px solid var(--border-strong);
+  border-radius: 10px;
+  background: var(--panel-2);
+  padding: 8px 10px;
+  font-variant-numeric: tabular-nums;
+  font-size: 12px;
+}
+.diag-row { display: flex; justify-content: space-between; gap: 12px; padding: 2px 0; }
+.diag-key { color: var(--muted-dim); }
+.diag-val { color: #cfe3ff; font-weight: 600; }
+#gl-limit { color: #e0b26a; }
+.btn[data-active="true"] { border-color: var(--accent); color: #fff; }
+
+#gl-mode, #gl-layout, #gl-physics { color: #a5f3c8; }
+#perf-note { font-variant-numeric: tabular-nums; }
+#perf-note[data-perf="true"] { color: #6fae86; }
+#session-log { line-height: 1.7; word-break: break-word; }
+#session-log .log-line { color: var(--muted-dim); }
+.stage-canvas[data-perf="true"] { image-rendering: auto; }

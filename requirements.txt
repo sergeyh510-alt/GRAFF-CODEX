@@ -1,0 +1,14 @@
+# GRAFF - the actual runtime/test dependencies.
+#
+# Install with:  python -m pip install -r requirements.txt
+#
+# The server prefers the FastAPI backend when fastapi+uvicorn are importable and
+# otherwise falls back to a standard-library server that needs none of these
+# (so `python run.py` still works with an empty environment).  networkx is only
+# needed for GraphML/GEXF export; watchdog is optional (a polling tailer is
+# built in and used by default).
+
+fastapi>=0.110
+uvicorn>=0.27
+networkx>=3.2
+watchdog>=3.0
