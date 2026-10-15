@@ -13,6 +13,7 @@ import threading
 import time
 from typing import Any, Dict, List, Optional, Sequence
 
+from . import __version__
 from .graph import DEFAULT_NODE_CAP, TEXT_CAP, Event
 from .hub import Fanout
 from .rollout import (
@@ -338,6 +339,7 @@ class LiveEngine:
         tailer = self.tailer
         stats = self.store.stats()
         return {
+            "version": __version__,
             "session": self.store.session_path,
             "sessions_root": self.sessions_root,
             "journal": self.store.journal_path,

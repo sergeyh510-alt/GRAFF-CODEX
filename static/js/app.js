@@ -1033,6 +1033,15 @@
       if (fb) fb.checked = s.follow;
     }
     if (s.log) applyServerLog(s.log);
+    if (s.version) applyVersion(s.version);
+  }
+
+  var aboutVersion = null;
+  function applyVersion(version) {
+    if (!version || version === aboutVersion) return;
+    aboutVersion = version;
+    var el = $("about-version");
+    if (el) el.textContent = "версия " + version;
   }
 
   var serverLogLines = [];
@@ -2323,6 +2332,38 @@
     if (panel3d) panel3d.hidden = !is3d;
   }
 
+  // ------------------------------------------------------------------ //
+  // about / help modal
+  // ------------------------------------------------------------------ //
+  function aboutOpen() {
+    var box = $("about-modal");
+    if (!box) return false;
+    box.hidden = false;
+    var close = $("about-close");
+    if (close) close.focus();
+    return true;
+  }
+
+  function aboutClose() {
+    var box = $("about-modal");
+    if (!box) return;
+    box.hidden = true;
+  }
+
+  function aboutIsOpen() {
+    var box = $("about-modal");
+    return !!box && !box.hidden;
+  }
+
+  function aboutFromUrl() {
+    try {
+      var v = new URLSearchParams(location.search).get("about");
+      if (v === null) return false;
+      return v === "" || v === "1" || v === "true" || v === "yes";
+    } catch (e) {}
+    return false;
+  }
+
   function switchMode(mode) {
     if (mode === state.mode) return;
     state.mode = mode;
@@ -2688,6 +2729,12 @@
       if (!select.value) { toast("Сессия не выбрана"); return; }
       openSession(select.value);
     });
+    $("about-btn").addEventListener("click", function () { aboutOpen(); });
+    $("about-close").addEventListener("click", aboutClose);
+    $("about-modal").addEventListener("click", function (e) {
+      // click on the dimmed backdrop closes; clicks inside the card do not
+      if (e.target === $("about-modal")) aboutClose();
+    });
     $("btn-enrich").addEventListener("click", runEnrich);
 
     $("btn-save-json").addEventListener("click", function () { exportGraph("json"); });
@@ -2697,7 +2744,10 @@
 
     $("details-close").addEventListener("click", function () { $("details").setAttribute("data-open", "false"); });
     document.addEventListener("keydown", function (e) {
-      if (e.key === "Escape") { $("details").setAttribute("data-open", "false"); clearSelection(); }
+      if (e.key !== "Escape") return;
+      // the About modal is modal: it swallows Escape first
+      if (aboutIsOpen()) { aboutClose(); return; }
+      $("details").setAttribute("data-open", "false"); clearSelection();
     });
     $("btn-copy").addEventListener("click", function () {
       var text = $("details-text").textContent || "";
@@ -2765,6 +2815,8 @@
     else {
       applyLayout();
     }
+
+    if (aboutFromUrl()) aboutOpen();
 
     applyPerfMode();
     startFpsMeter();
@@ -2858,6 +2910,7 @@
       }
       return { start: snap(markerStart, MARKER_GREEN), end: snap(markerEnd, MARKER_YELLOW) };
     },
+    about: { open: aboutOpen, close: aboutClose, isOpen: aboutIsOpen, fromUrl: aboutFromUrl },
     laneShifts: function () {
       var out = {};
       for (var k in state.laneShifts) if (state.laneShifts.hasOwnProperty(k)) out[k] = state.laneShifts[k];

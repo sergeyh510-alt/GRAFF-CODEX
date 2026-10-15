@@ -854,6 +854,143 @@ class RemovedFloatModeTests(unittest.TestCase):
             self.assertIn(needle, html, "index.html is missing %r" % needle)
 
 
+class AboutModalTests(unittest.TestCase):
+    """The in-app help: an About modal reachable by button and ?about=1."""
+
+    @classmethod
+    def _read(cls, *parts):
+        with io.open(os.path.join(PROJECT_ROOT, *parts), encoding="utf-8") as handle:
+            return handle.read()
+
+    def test_index_has_about_button_and_modal(self):
+        html = self._read("static", "index.html")
+        self.assertIn('id="about-btn"', html)
+        self.assertIn('id="about-modal"', html)
+        self.assertIn('id="about-close"', html)
+        self.assertIn('id="about-version"', html)
+        start = html.find('id="about-modal"')
+        self.assertIn("hidden", html[start:start + 200],
+                      "the About modal must start hidden")
+        self.assertIn('role="dialog"', html)
+
+    def test_about_modal_shows_the_required_content(self):
+        html = self._read("static", "index.html")
+        for needle in (
+            "GRAFF \u2014 \u0436\u0438\u0432\u043e\u0439 \u0433\u0440\u0430\u0444 \u0440\u0430\u0441\u0441\u0443\u0436\u0434\u0435\u043d\u0438\u0439 \u0438 \u0434\u0435\u0439\u0441\u0442\u0432\u0438\u0439 Codex",
+            "Sergey Chekryzhov",
+            "sergeyh510@gmail.com",
+            "sergeyh510-alt",
+            "https://github.com/sergeyh510-alt/GRAFF-CODEX",
+            "www.linkedin.com/in/sergey-chekryzhov-a38778217",
+            "@SergeyChekryzhov",
+            "LICENSE",
+        ):
+            self.assertIn(needle, html, "the About modal is missing %r" % needle)
+        self.assertIn("\u043f\u043e \u043b\u0438\u0446\u0435\u043d\u0437\u0438\u0438 MIT", html)
+
+    def test_about_links_are_clickable_and_safe(self):
+        html = self._read("static", "index.html")
+        start = html.find('id="about-modal"')
+        modal = html[start:]
+        for url in ("https://github.com/sergeyh510-alt",
+                    "https://github.com/sergeyh510-alt/GRAFF-CODEX",
+                    "https://www.linkedin.com/in/sergey-chekryzhov-a38778217",
+                    "https://t.me/SergeyChekryzhov",
+                    "https://github.com/sergeyh510-alt/GRAFF-CODEX/blob/main/LICENSE"):
+            self.assertIn('href="%s"' % url, modal, "missing link %s" % url)
+        self.assertIn('href="mailto:sergeyh510@gmail.com"', modal)
+        self.assertGreaterEqual(modal.count('target="_blank"'), 5)
+        self.assertGreaterEqual(modal.count('rel="noopener"'), 5)
+        self.assertEqual(modal.count('target="_blank"'), modal.count('rel="noopener"'))
+
+    def test_about_has_no_external_resources_or_trackers(self):
+        html = self._read("static", "index.html")
+        start = html.find('id="about-modal"')
+        end = html.find("<!-- boot.js loads")
+        modal = html[start:end if end > start else len(html)]
+        for needle in ("<img", "<iframe", "http://", "google-analytics", "gtag(",
+                       'rel="preload"', "<script"):
+            self.assertNotIn(needle, modal,
+                             "the About modal must not pull external resources: %r" % needle)
+
+    def test_about_js_wires_open_close_and_url(self):
+        text = self._read("static", "js", "app.js")
+        self.assertIn("function aboutOpen(", text)
+        self.assertIn("function aboutClose(", text)
+        self.assertIn("function aboutFromUrl(", text)
+        self.assertIn('new URLSearchParams(location.search).get("about")', text)
+        self.assertIn('$("about-btn").addEventListener("click"', text)
+        self.assertIn('$("about-close").addEventListener("click", aboutClose)', text)
+        self.assertIn('if (e.target === $("about-modal")) aboutClose();', text)
+        self.assertIn("if (aboutIsOpen()) { aboutClose(); return; }", text)
+        self.assertIn("if (aboutFromUrl()) aboutOpen();", text)
+
+    def test_about_version_comes_from_the_status_payload(self):
+        app = self._read("static", "js", "app.js")
+        self.assertIn("if (s.version) applyVersion(s.version);", app)
+        self.assertIn('el.textContent = "\u0432\u0435\u0440\u0441\u0438\u044f " + version;', app)
+        engine = self._read("graff", "engine.py")
+        self.assertIn("from . import __version__", engine)
+        self.assertIn('"version": __version__,', engine)
+        import graff
+
+        self.assertTrue(graff.__version__)
+
+    def test_about_modal_is_hidden_by_default_in_css(self):
+        css = self._read("static", "css", "styles.css")
+        self.assertIn(".about-overlay[hidden] { display: none; }", css)
+        self.assertIn("[hidden] { display: none !important; }", css)
+        start = css.find(".about-overlay {")
+        self.assertGreater(start, 0)
+        self.assertIn("z-index: 60;", css[start:start + 600])
+
+
+class AboutStatusVersionTests(unittest.TestCase):
+    """/api/status must expose the version the About modal prints."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.port = free_port()
+        cls.base = "http://127.0.0.1:%d" % cls.port
+        env = dict(os.environ)
+        env.pop("ROUTERAI_API_KEY", None)
+        env.pop("AITUNNEL_API_KEY", None)
+        cls.proc = subprocess.Popen(
+            [sys.executable, "-u", "run.py", "--port", str(cls.port), "--no-journal"],
+            cwd=PROJECT_ROOT, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, env=env,
+        )
+        deadline = time.time() + 40
+        while time.time() < deadline:
+            try:
+                urllib.request.urlopen(cls.base + "/api/status", timeout=5).read()
+                return
+            except Exception:
+                time.sleep(0.3)
+        cls.proc.terminate()
+        raise RuntimeError("server did not start")
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.proc.terminate()
+        try:
+            cls.proc.wait(timeout=6)
+        except Exception:
+            cls.proc.kill()
+
+    def test_status_reports_the_package_version(self):
+        import graff
+
+        with urllib.request.urlopen(self.base + "/api/status", timeout=20) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+        self.assertEqual(payload.get("version"), graff.__version__)
+
+    def test_index_serves_the_about_modal(self):
+        with urllib.request.urlopen(self.base + "/", timeout=20) as response:
+            html = response.read().decode("utf-8", "replace")
+        self.assertIn('id="about-modal"', html)
+        self.assertIn("Sergey Chekryzhov", html)
+
+
 class PackagingTests(unittest.TestCase):
     """(2) the exe build bundles static/ and keeps state outside the bundle."""
 

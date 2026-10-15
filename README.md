@@ -30,10 +30,12 @@
 - [Live mode and session selection](#live-mode-and-session-selection)
 - [Optional AI enrichment](#optional-ai-enrichment)
 - [Performance notes](#performance-notes)
+- [In-app help](#in-app-help)
 - [Engineering log: what actually broke](#engineering-log-what-actually-broke)
 - [Project layout](#project-layout)
 - [Tests](#tests)
 - [Documentation](#documentation)
+- [Contacts](#contacts)
 
 ---
 
@@ -205,19 +207,37 @@ run.py               entry point
 build.py             PyInstaller build, produces dist/GRAFF.exe
 ```
 
+## In-app help
+
+A **"?"** button in the header, next to the view switcher, opens the About dialog: what the app is, the author, contacts and the license. It closes with the × button, `Esc` or a click on the dimmed backdrop. The dialog makes no external requests and uses no trackers, and every link opens in a new tab only when clicked. The version shown comes from the same source as `/api/status` (i.e. `graff.__version__`) and is never duplicated in the markup.
+
+The dialog can be opened straight from the URL, without any clicking: `http://127.0.0.1:8756/?about=1`.
+
 ## Tests
 
 ```cmd
 python -m unittest discover -s tests -v
 ```
 
-63 checks covering the parser against a real rollout, session selection, session persistence, the API surface, static file MIME handling, the frontend wiring and the rendering modes. All green.
+72 checks covering the parser against a real rollout, session selection, session persistence, the API surface, static file MIME handling, the frontend wiring, the rendering modes and the About dialog. All green.
 
 ## Documentation
 
 - [`docs/linkedin-article-en.md`](docs/linkedin-article-en.md) and [`docs/linkedin-article-ru.md`](docs/linkedin-article-ru.md): the story behind the project, written for data engineers
 - `docs/GRAFF_LinkedIn_EN.docx` and `docs/GRAFF_LinkedIn_RU.docx`: the same article as documents, diagrams included
 - `docs/figures/`: source diagrams, regenerated with `python scripts/mermaid_local.py docs/linkedin-article-en.md`
+
+## Contacts
+
+**Sergey Chekryzhov**
+
+- Email: sergeyh510@gmail.com
+- GitHub: [sergeyh510-alt](https://github.com/sergeyh510-alt)
+- Project: https://github.com/sergeyh510-alt/GRAFF-CODEX
+- LinkedIn: [sergey-chekryzhov](https://www.linkedin.com/in/sergey-chekryzhov-a38778217)
+- Telegram: [@SergeyChekryzhov](https://t.me/SergeyChekryzhov)
+
+This project is distributed under the MIT License, see the [LICENSE](LICENSE) file for details.
 
 ---
 
