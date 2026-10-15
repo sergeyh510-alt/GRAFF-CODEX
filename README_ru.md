@@ -10,7 +10,7 @@
 ![3d-force-graph](https://img.shields.io/badge/3d--force--graph-раскладка%20силами-6f42c1)
 ![PyInstaller](https://img.shields.io/badge/PyInstaller-один%20exe-2E3A59?logo=python&logoColor=white)
 ![Платформа](https://img.shields.io/badge/платформа-Windows-0078D6?logo=windows&logoColor=white)
-![Тесты](https://img.shields.io/badge/тесты-63%20проверки-2ea44f)
+![Тесты](https://img.shields.io/badge/тесты-72%20проверки-2ea44f)
 ![Ключи](https://img.shields.io/badge/ключи%20API-только%20из%20окружения-critical)
 
 **GRAFF превращает лог пишущего код агента в живой граф, который можно читать.** Каждый шаг рассуждения, вызов инструмента, правка файла и ошибка становятся узлами, каждая причинная связь становится ребром. Граф приходит в браузер, пока агент ещё работает, а любой запуск можно сохранить, проиграть и выгрузить.

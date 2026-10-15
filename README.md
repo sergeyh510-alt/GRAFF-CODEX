@@ -10,7 +10,7 @@
 ![3d-force-graph](https://img.shields.io/badge/3d--force--graph-force%20layout-6f42c1)
 ![PyInstaller](https://img.shields.io/badge/PyInstaller-single%20exe-2E3A59?logo=python&logoColor=white)
 ![Platform](https://img.shields.io/badge/platform-Windows-0078D6?logo=windows&logoColor=white)
-![Tests](https://img.shields.io/badge/tests-63%20checks-2ea44f)
+![Tests](https://img.shields.io/badge/tests-72%20checks-2ea44f)
 ![Keys](https://img.shields.io/badge/API%20keys-environment%20only-critical)
 
 **GRAFF turns the log of a coding agent into a live graph you can read.** Every reasoning step, tool call, file edit and error becomes a node; every causal link becomes an edge. The graph streams into the browser while the agent is still working, and every run can be saved, replayed and exported.
