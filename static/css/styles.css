@@ -592,3 +592,41 @@ output { font-size: 12px; color: var(--text); min-width: 46px; text-align: right
 .about-contacts a:hover, .about-block a:hover { text-decoration: underline; color: #a9cdff; }
 
 .about-hint { margin: 6px 0 0; }
+
+.about-modes { list-style: none; margin: 0; padding: 0; }
+.about-modes li { display: flex; gap: 8px; padding: 4px 0; font-size: 13px; line-height: 1.55; color: var(--muted); }
+.about-modes .about-key { flex: 0 0 150px; color: #a9cdff; }
+
+/* ------------------------------------------------------------------ */
+/* river mode: the third view (computed stream of time)                 */
+/* ------------------------------------------------------------------ */
+.stage-river { position: absolute; inset: 0; background: radial-gradient(900px 700px at 50% 40%, #070d18 0%, #04070c 70%); }
+.stage-river[hidden] { display: none; }
+.stage-river canvas { display: block; }
+
+/* glowing legend swatches, in the river palette */
+.legend-river { margin-top: 8px; }
+.legend-river li { cursor: default; }
+.legend-river .dot-glow {
+  width: 14px;
+  height: 14px;
+  border-radius: 50%;
+  flex: 0 0 14px;
+  position: relative;
+  background: currentColor;
+  box-shadow: 0 0 10px 2px currentColor, 0 0 22px 6px rgba(255, 255, 255, 0.06);
+}
+.legend-river .dot-glow::after {
+  content: "";
+  position: absolute;
+  inset: -5px;
+  border-radius: 50%;
+  background: radial-gradient(circle, currentColor 0%, transparent 70%);
+  opacity: 0.35;
+}
+.legend-river .lname { color: var(--text); }
+
+#river-note { color: #8fc7ff; }
+#river-groups { color: #a5f3c8; }
+#river-sparks { color: #c9a7ff; }
+

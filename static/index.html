@@ -21,6 +21,7 @@
     <div class="mode-tabs" id="mode-tabs" role="tablist" aria-label="Режим визуализации">
       <button class="mode-tab" data-mode="2d" role="tab">2D-дорожки</button>
       <button class="mode-tab" data-mode="3d" role="tab">3D · нейронный мозг</button>
+      <button class="mode-tab" data-mode="river" role="tab">Русло · поток времени</button>
     </div>
 
     <button class="about-btn" id="about-btn" type="button" title="О программе — справка, автор и контакты"
@@ -52,6 +53,7 @@
         <li><span class="swatch" style="background:#ffce38"></span><span class="lname">конец цепочки (3D)</span></li>
         <li><span class="swatch" data-shift="true"></span><span class="lname">сдвиг узла вдоль дорожки (2D)</span></li>
       </ul>
+      <ul class="legend legend-river" id="legend-river"></ul>
     </section>
 
     <section class="panel">
@@ -164,6 +166,42 @@
       <p class="hint" id="gl-status"></p>
     </section>
 
+    <section class="panel" id="panel-river" hidden>
+      <h2>Русло · поток времени</h2>
+      <p class="hint">
+        Сессия как поток: по горизонтали — время (лента сворачивается полосами),
+        в стороны — ветвление шага, в глубину — слои. Позиция узла вычисляется один
+        раз и больше не меняется: новые события только дописываются в конец.
+      </p>
+      <label class="switch">
+        <input type="checkbox" id="river-collapse" checked />
+        <span>Свернуть повторы (группы «×N»)</span>
+      </label>
+      <label class="switch">
+        <input type="checkbox" id="river-follow" checked />
+        <span>Следовать за новыми (движется камера)</span>
+      </label>
+      <label class="switch">
+        <input type="checkbox" id="river-links" checked />
+        <span>Связи (градиент от причины к следствию)</span>
+      </label>
+      <div class="button-row">
+        <button id="btn-river-fit" class="btn">Уместить всё</button>
+        <button id="btn-river-latest" class="btn">К последнему</button>
+      </div>
+      <p class="hint" id="river-note"></p>
+      <div class="diag" id="river-diagnostics">
+        <div class="diag-row"><span class="diag-key">режим</span><span class="diag-val" id="river-mode">Русло</span></div>
+        <div class="diag-row"><span class="diag-key">узлов / связей</span><span class="diag-val" id="river-counts">—</span></div>
+        <div class="diag-row"><span class="diag-key">свёрнуто в группы</span><span class="diag-val" id="river-groups">—</span></div>
+        <div class="diag-row"><span class="diag-key">FPS</span><span class="diag-val" id="river-fps">—</span></div>
+        <div class="diag-row"><span class="diag-key">кадр</span><span class="diag-val" id="river-frame">—</span></div>
+        <div class="diag-row"><span class="diag-key">draw calls</span><span class="diag-val" id="river-calls">—</span></div>
+        <div class="diag-row"><span class="diag-key">треугольников</span><span class="diag-val" id="river-tris">—</span></div>
+        <div class="diag-row"><span class="diag-key">искр (живых/пул)</span><span class="diag-val" id="river-sparks">—</span></div>
+      </div>
+    </section>
+
     <section class="panel">
       <h2>Сессия</h2>
       <select id="session-select" class="select"></select>
@@ -213,6 +251,7 @@
   <main class="stage">
     <div class="stage-canvas" id="stage-canvas"></div>
     <div class="stage-gl" id="gl3d" hidden></div>
+    <div class="stage-gl stage-river" id="river3d" hidden></div>
 
     <div class="empty" id="graph-empty" hidden>
       <div class="empty-card">
@@ -298,14 +337,29 @@
         инструментов, правки файлов и ошибки становятся узлами, а связи между ними
         отражают причинность — что из чего выросло. Данные берутся напрямую из логов
         сессий Codex CLI и обновляются в реальном времени, без промежуточных экспортов.
-        Для чтения последовательности есть вид «2D-дорожки», а для формы длинных цепочек —
-        «3D · нейронный мозг». Любой граф можно сохранить и выгрузить: журнал событий,
-        снапшот в JSON, GraphML/GEXF и картинку PNG.
+        Один и тот же граф открывается в трёх видах: «2D-дорожки» читают последовательность,
+        «3D · нейронный мозг» показывает форму длинных цепочек, а «Русло · поток времени»
+        раскладывает сессию как ленту времени — с искрами по связям и остывающими узлами.
+        Любой граф можно сохранить и выгрузить: журнал событий, снапшот в JSON,
+        GraphML/GEXF и картинку PNG.
       </p>
 
       <div class="about-block">
         <h3>Автор</h3>
         <p>Sergey Chekryzhov</p>
+      </div>
+
+      <div class="about-block">
+        <h3>Режимы</h3>
+        <ul class="about-modes">
+          <li><span class="about-key">2D-дорожки</span> время по горизонтали, тип события по
+            вертикали; раскладки: дорожки, иерархия слева-направо и сверху-вниз, свободная физика.</li>
+          <li><span class="about-key">3D · нейронный мозг</span> объёмная форма цепочек, цвет по
+            времени, метки начала и конца.</li>
+          <li><span class="about-key">Русло · поток времени</span> вычисляемая раскладка без физики:
+            лента сворачивается полосами, ветвление расходится в стороны, повторы сворачиваются
+            в группы «×N», а движение искры по связи означает время.</li>
+        </ul>
       </div>
 
       <div class="about-block">

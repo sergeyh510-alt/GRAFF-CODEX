@@ -842,8 +842,9 @@ class RemovedFloatModeTests(unittest.TestCase):
         self.assertIn('state.mode = "2d";', text)
         # the normalized value is written back right away
         self.assertIn("savePrefs();", text)
-        # ?mode= accepts only 2d/3d now
-        self.assertIn('if (m === "2d" || m === "3d") return m;', text)
+        # ?mode= still rejects float; river was added later and is allowed
+        self.assertIn('if (m === "2d" || m === "3d" || m === "river") return m;', text)
+        self.assertNotIn('m === "float"', text)
 
     def test_diagnostics_have_no_drift_row(self):
         with io.open(os.path.join(PROJECT_ROOT, "static", "index.html"),
@@ -989,6 +990,460 @@ class AboutStatusVersionTests(unittest.TestCase):
             html = response.read().decode("utf-8", "replace")
         self.assertIn('id="about-modal"', html)
         self.assertIn("Sergey Chekryzhov", html)
+
+
+class RiverModeTests(unittest.TestCase):
+    """The third view: «Русло» (a computed stream of time, no physics)."""
+
+    @classmethod
+    def _read(cls, *parts):
+        with io.open(os.path.join(PROJECT_ROOT, *parts), encoding="utf-8") as handle:
+            return handle.read()
+
+    @classmethod
+    def _river(cls):
+        return cls._read("static", "js", "river.js")
+
+    def test_index_exposes_three_modes(self):
+        html = self._read("static", "index.html")
+        for mode in ('data-mode="2d"', 'data-mode="3d"', 'data-mode="river"'):
+            self.assertIn(mode, html, "index.html is missing the %s tab" % mode)
+        self.assertIn("Русло", html)
+        self.assertIn('id="river3d"', html)
+        self.assertIn('id="panel-river"', html)
+        self.assertIn('id="legend-river"', html)
+
+    def test_river_panel_has_all_the_toggles(self):
+        html = self._read("static", "index.html")
+        for control in ('id="river-collapse"', 'id="river-follow"', 'id="river-links"',
+                        'id="btn-river-fit"', 'id="btn-river-latest"',
+                        'id="river-fps"', 'id="river-calls"', 'id="river-sparks"'):
+            self.assertIn(control, html, "the river panel is missing %r" % control)
+        # the "fit everything" button is required in every mode
+        self.assertIn("Уместить всё", html)
+
+    def test_river_mode_is_selectable_by_url(self):
+        app = self._read("static", "js", "app.js")
+        self.assertIn('if (m === "2d" || m === "3d" || m === "river") return m;', app)
+        # the mode is persisted like the other two
+        self.assertIn("mode: state.mode,", app)
+        self.assertIn('if (p.mode === "2d" || p.mode === "3d" || p.mode === "river")', app)
+
+    def test_river_layout_is_computed_and_append_only(self):
+        river = self._river()
+        # a slot maps to a fixed point of the snaked stream: no forces involved
+        self.assertIn("function coordsFor(slot)", river)
+        self.assertIn("BAND_CAP", river)
+        self.assertIn("function packRuns(", river)
+        self.assertIn("function routineUnits(", river)
+        # branching spreads by the child ordinal only
+        self.assertIn("function branchOffset(k)", river)
+        # never a physics call anywhere in the river module
+        for banned in ("applyPhysics", "physicsEnabled", "Math.random"):
+            self.assertNotIn(banned, river, "river.js must stay deterministic: %r" % banned)
+
+    def test_river_uses_instancing_lines_and_a_spark_pool(self):
+        river = self._river()
+        self.assertIn("new THREE_.InstancedMesh(", river)   # nodes: one draw call
+        self.assertIn("new THREE_.LineSegments(", river)    # links: one draw call
+        self.assertIn("SPARK_POOL", river)                  # sparks: bounded
+        self.assertIn("AdditiveBlending", river)
+        # never a per-node DOM element or a per-node scene object
+        self.assertNotIn("nodeThreeObject", river)
+        self.assertNotIn("createElement(\"div\")", river)
+
+    def test_river_animation_budget(self):
+        river = self._river()
+        self.assertIn("var FRESH_CAP =", river)             # only fresh nodes animate
+        self.assertIn("SPARK_STAGGER_MS", river)            # a batch leaves one by one
+        self.assertIn("sparkDuration: function (distance, speed)", river)  # long edge -> longer spark
+        self.assertIn("ERROR_FLASH_MS", river)              # errors flash longest
+        self.assertIn("function crest(", river)             # step finished -> crest
+        blocked = re.search(r"function isPaused\(\)\s*\{[^}]*document\.hidden", river)
+        self.assertIsNotNone(blocked, "river animation must stop on a hidden tab")
+        self.assertIn("function recolour(", river)          # cooling is a colour property
+
+    def test_river_palette_is_the_agreed_one(self):
+        river = self._river()
+        for color in ("#a855f7", "#e2f3ff", "#2b8cff", "#00e5a0", "#ffb020", "#ff2d55",
+                      "#7dff5a", "#ffd60a"):
+            self.assertIn(color, river, "river.js is missing the colour %s" % color)
+        # old nodes go to a deep blue-violet, they do not turn grey
+        self.assertIn("cold:", river)
+        self.assertIn("COOL_MIX", river)
+        # red stays reserved for errors
+        self.assertIn('if (type === "error")', river)
+
+    def test_river_keeps_the_shared_features(self):
+        app = self._read("static", "js", "app.js")
+        # the shared machinery is reached from the river branch, not reimplemented
+        for needle in ("} else if (state.mode === \"river\") {",
+                       "syncRiver();",
+                       "if (state.mode === \"river\") syncRiver(true);",
+                       "riverFocus(viewId);",
+                       "riverCrest();",
+                       "if (state.mode === \"river\") {"):
+            self.assertIn(needle, app, "app.js river integration is missing %r" % needle)
+        # export, search, filters and details are untouched by the new mode
+        for needle in ("function exportGraph(", "function recomputeMatches(", "function showDetails(",
+                       "function toggleType(", "function buildTypeFilters("):
+            self.assertIn(needle, app)
+
+    def test_river_leaves_the_other_two_modes_alone(self):
+        app = self._read("static", "js", "app.js")
+        # the old 3D and 2D code paths are still there, unchanged in shape
+        self.assertIn("factory({ controlType: \"orbit\" })(box)", app)
+        self.assertIn("function positionLanes()", app)
+        self.assertIn("function layoutOptions()", app)
+        # leaving a mode stops its loops: no timer from one view survives
+        self.assertIn('if (was === "3d") stop3d();', app)
+        self.assertIn('if (was === "river") stopRiver();', app)
+        self.assertIn("function stopRiver()", app)
+        self.assertIn("function stop3d()", app)
+
+    def test_river_is_only_animated_while_visible(self):
+        app = self._read("static", "js", "app.js")
+        self.assertIn("function riverWanted()", app)
+        vis = app.find("function onVisibilityChange()")
+        self.assertGreater(vis, 0)
+        body = app[vis:vis + 1200]
+        self.assertIn("stopRiver();", body, "hiding the tab must freeze the river")
+        self.assertIn("river.start();", body, "showing the tab must resume the river")
+
+    def test_river_sparks_are_off_in_performance_mode(self):
+        app = self._read("static", "js", "app.js")
+        start = app.find("function syncRiver(")
+        self.assertGreater(start, 0)
+        body = app[start:start + 2600]
+        self.assertIn("if (!state.perf) river.spawnSparks(res.indices);", body)
+
+    def test_river_script_is_loaded_by_boot(self):
+        boot = self._read("static", "js", "boot.js")
+        self.assertIn("river.js", boot)
+        self.assertIn("window.GRAFFRiver", self._river())
+        # the static table must serve .js as javascript (already covered, asserted here again)
+        from graff import static_files
+
+        self.assertIn("javascript", static_files.content_type_for("x.js").lower())
+
+
+class RiverLayoutTests(unittest.TestCase):
+    """The computed layout itself: stable positions, snaking, grouping."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.node = shutil.which("node")
+        cls.river = os.path.join(PROJECT_ROOT, "static", "js", "river.js")
+
+    def _run(self, script_name, body):
+        if not self.node:
+            self.skipTest("node is not available")
+        script = os.path.join(PROJECT_ROOT, ".tmp", script_name)
+        os.makedirs(os.path.dirname(script), exist_ok=True)
+        with io.open(script, "w", encoding="utf-8") as handle:
+            handle.write(body)
+        proc = subprocess.run([self.node, script], cwd=PROJECT_ROOT, stdout=subprocess.PIPE,
+                              stderr=subprocess.STDOUT, timeout=120)
+        self.assertEqual(proc.returncode, 0, proc.stdout.decode("utf-8", "replace"))
+        return json.loads(proc.stdout.decode("utf-8", "replace"))
+
+    def _harness(self, payload):
+        return (
+            "global.window = global;\n"
+            "const fs = require('fs'), vm = require('vm');\n"
+            "const ctx = { window: global, document: { createElement: () => ({ getContext: () => ({}) }) }, console };\n"
+            "vm.createContext(ctx);\n"
+            "vm.runInContext(fs.readFileSync(%r, 'utf8'), ctx);\n"
+            "const R = ctx.window.GRAFFRiver;\n" % self.river
+        ) + payload
+
+    def test_existing_nodes_never_move(self):
+        out = self._run("river_stability.js", self._harness(
+            "function linear(n) { const T=['reason','message','tool_call','tool_result','file_edit','error'];\n"
+            "  const o=[]; let p=null;\n"
+            "  for (let i=0;i<n;i++){const t=T[i%6],id='n'+i;\n"
+            "    o.push({id:id,source:{id:id,ts:1000+i,type:t,actor:'codex',label:'e'+i,parent:p,meta:{name:'exec_command',call_id:'c'+i}}});p=id;}\n"
+            "  return o; }\n"
+            "function snap(ns){const o={};ns.forEach(n=>{o[n.id]=[n.x,n.y,n.z,n.slot];});return o;}\n"
+            "const a=snap(R.layout(linear(300), true).nodes);\n"
+            "const b=snap(R.layout(linear(303), true).nodes);\n"
+            "let moved=0,checked=0;\n"
+            "Object.keys(a).forEach(id=>{if(!b[id])return;checked++;if(a[id].join()!==b[id].join())moved++;});\n"
+            "console.log(JSON.stringify({checked:checked,moved:moved}));"))
+        self.assertGreater(out["checked"], 0)
+        self.assertEqual(out["moved"], 0,
+                         "a node already on screen must never move when an event arrives")
+
+    def test_routine_runs_collapse_into_groups(self):
+        out = self._run("river_groups.js", self._harness(
+            "function sess(n){const o=[];let p=null,i=0;\n"
+            "  while(o.length<n){const cid='c'+i;\n"
+            "    const call={id:'n'+i,ts:1000+i,type:'tool_call',actor:'codex',parent:p,meta:{name:'exec_command',call_id:cid}};\n"
+            "    const res={id:'n'+i+'r',ts:1000+i+0.5,type:'tool_result',actor:'codex',parent:call.id,meta:{name:'exec_command',call_id:cid}};\n"
+            "    o.push({id:call.id,source:call});o.push({id:res.id,source:res});p=res.id;i+=2;}\n"
+            "  return o.slice(0,n);}\n"
+            "const it=sess(600);\n"
+            "const off=R.layout(it,false).nodes.length;\n"
+            "const on=R.layout(it,true).nodes;\n"
+            "console.log(JSON.stringify({without:off,with:on.length,biggest:Math.max.apply(null,on.map(n=>n.count))}));"))
+        self.assertLess(out["with"], out["without"])
+        self.assertGreater(out["biggest"], 1)
+
+    def test_stream_snakes_into_bands(self):
+        out = self._run("river_bands.js", self._harness(
+            "const T=['reason','message','tool_call','tool_result','file_edit','error'];\n"
+            "const it=[];let p=null;\n"
+            "for(let i=0;i<500;i++){const t=T[i%6],id='n'+i;\n"
+            "  it.push({id:id,source:{id:id,ts:1000+i,type:t,actor:'codex',label:'e',parent:p,meta:{name:'t'+(i%2)}}});p=id;}\n"
+            "const ns=R.layout(it,false).nodes;\n"
+            "const cap=R.constants.BAND_CAP;\n"
+            "console.log(JSON.stringify({cap:cap,bands:new Set(ns.map(n=>n.band)).size,\n"
+            "  first:ns[0].x, last_of_band:ns[cap-1].x, first_of_next:ns[cap].x,\n"
+            "  second_of_next:ns[cap+1].x, z0:ns[0].z, z1:ns[cap].z}));"))
+        self.assertGreater(out["bands"], 1, "a long stream must be folded into bands")
+        # the snake turns at the band edge: the last slot of a band and the first
+        # slot of the next one share the same x, and the next band sits deeper
+        self.assertEqual(out["last_of_band"], out["first_of_next"])
+        self.assertNotEqual(out["z0"], out["z1"])
+        # band 0 runs left -> right, band 1 runs back right -> left
+        self.assertEqual(out["first"], 0)
+        self.assertLess(out["second_of_next"], out["first_of_next"])
+
+    def test_branching_spreads_siblings(self):
+        out = self._run("river_branch.js", self._harness(
+            "const it=[{id:'root',source:{id:'root',ts:1,type:'message',actor:'codex',parent:null,meta:{}}},\n"
+            "  {id:'step',source:{id:'step',ts:2,type:'reason',actor:'codex',parent:'root',meta:{}}}];\n"
+            "for(let c=0;c<5;c++)it.push({id:'c'+c,source:{id:'c'+c,ts:3+c,type:'tool_call',actor:'codex',parent:'step',meta:{name:'exec',call_id:'k'+c}}});\n"
+            "const ns=R.layout(it,false).nodes;\n"
+            "console.log(JSON.stringify(ns.map(n=>[n.id,n.ord,n.y])));"))
+        ys = {row[0]: row[2] for row in out}
+        self.assertEqual(len(set(ys[k] for k in ys if k.startswith("r:c"))), 5,
+                         "parallel calls of one step must spread sideways")
+
+    def test_spark_duration_follows_edge_length(self):
+        out = self._run("river_spark.js", self._harness(
+            "console.log(JSON.stringify({short:R.sparkDuration(20),long:R.sparkDuration(900),cap:R.sparkDuration(1e6)}));"))
+        self.assertLess(out["short"], out["long"])
+        self.assertLessEqual(out["cap"], 600)
+        self.assertGreaterEqual(out["short"], 300)
+
+
+class RiverPaintTests(unittest.TestCase):
+    """The river must really paint.  Regression for the black canvas in
+    ?mode=river: the scene was built, but no frame was ever drawn."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.node = shutil.which("node")
+        cls.river = os.path.join(PROJECT_ROOT, "static", "js", "river.js")
+
+    def _run(self, script_name, body):
+        if not self.node:
+            self.skipTest("node is not available")
+        script = os.path.join(PROJECT_ROOT, ".tmp", script_name)
+        os.makedirs(os.path.dirname(script), exist_ok=True)
+        with io.open(script, "w", encoding="utf-8") as handle:
+            handle.write(body)
+        proc = subprocess.run([self.node, script], cwd=PROJECT_ROOT, stdout=subprocess.PIPE,
+                              stderr=subprocess.STDOUT, timeout=120)
+        self.assertEqual(proc.returncode, 0, proc.stdout.decode("utf-8", "replace"))
+        return json.loads(proc.stdout.decode("utf-8", "replace"))
+
+    def _scene_harness(self, payload):
+        """Runs the real river.js against a three stub that behaves like three
+        where it matters: an InstancedMesh starts with an all-zero matrix, and a
+        zero matrix draws nothing at all, so an instance nobody wrote is
+        invisible.  Time and requestAnimationFrame are controlled by the test,
+        so the render loop is driven deterministically."""
+        return (
+            "global.window = global;\n"
+            "const fs = require('fs'), vm = require('vm');\n"
+            "let scene = null;\n"
+            "function scaleOf(e) { return Math.max(Math.abs(e[0]), Math.abs(e[5]), Math.abs(e[10])); }\n"
+            "class Vec3 { constructor(x, y, z) { this.x = x || 0; this.y = y || 0; this.z = z || 0; }\n"
+            "  set(x, y, z) { this.x = x; this.y = y; this.z = z; return this; }\n"
+            "  copy(v) { this.x = v.x; this.y = v.y; this.z = v.z; return this; }\n"
+            "  project() { this.x = 0.1; this.y = 0.1; this.z = 0.9; return this; } }\n"
+            "class Col { constructor(c) { this.r = 0.5; this.g = 0.5; this.b = 0.5; if (c !== undefined) this.set(c); }\n"
+            "  set() { return this; } lerp() { return this; } }\n"
+            "class Obj3 { constructor() { this.children = []; this.position = new Vec3(); this.scale = new Vec3(1, 1, 1);\n"
+            "  this.visible = true; this.frustumCulled = true; } add(o) { this.children.push(o); return o; }\n"
+            "  remove(o) { return o; } lookAt() {} }\n"
+            "class Geo { constructor() { this.attributes = {}; this.drawRange = { count: 0 }; }\n"
+            "  setAttribute(n, a) { this.attributes[n] = a; return this; }\n"
+            "  setDrawRange(s, c) { this.drawRange = { count: c }; } dispose() {} }\n"
+            "class Attr { constructor(a, s) { this.array = a; this.itemSize = s; this.needsUpdate = false; } }\n"
+            "class Mat { constructor(o) { Object.assign(this, o || {}); } dispose() {} }\n"
+            "class Pts extends Obj3 { constructor(g, m) { super(); this.geometry = g; this.material = m; } }\n"
+            "class Lines extends Obj3 { constructor(g, m) { super(); this.geometry = g; this.material = m; } }\n"
+            "class Inst extends Obj3 { constructor(g, m, n) { super(); this.geometry = g; this.material = m; this.count = 0;\n"
+            "  this.cap = n; this.instanceMatrix = { array: new Float64Array(n * 16), setUsage() {}, needsUpdate: false };\n"
+            "  this.instanceColor = null; }\n"
+            "  setMatrixAt(i, m) { const o = i * 16; for (let k = 0; k < 16; k++) this.instanceMatrix.array[o + k] = m.elements[k]; }\n"
+            "  setColorAt(i, c) { if (!this.instanceColor) { const a = new Float32Array(this.cap * 3); a.fill(1);\n"
+            "      this.instanceColor = { array: a }; } this.instanceColor.array[i * 3] = c.r;\n"
+            "    this.instanceColor.array[i * 3 + 1] = c.g; this.instanceColor.array[i * 3 + 2] = c.b; }\n"
+            "  liveInstances() { let n = 0; for (let i = 0; i < this.count; i++)\n"
+            "    if (scaleOf(this.instanceMatrix.array.slice(i * 16, i * 16 + 16)) > 1e-6) n++; return n; } }\n"
+            "class M4 { constructor() { this.elements = new Float64Array(16); }\n"
+            "  compose(p, q, s) { const e = this.elements; e[0] = s.x; e[5] = s.y; e[10] = s.z; e[15] = 1;\n"
+            "    e[12] = p.x; e[13] = p.y; e[14] = p.z; return this; } }\n"
+            "class Renderer { constructor() { this.domElement = { tagName: 'CANVAS', style: {}, parentNode: null,\n"
+            "    addEventListener() {}, removeEventListener() {} }; this.info = { render: { calls: 0, triangles: 0 } }; }\n"
+            "  setClearColor() {} setPixelRatio() {} setSize() {} dispose() {}\n"
+            "  render(sc) { this.info.render.calls = 0; this.info.render.triangles = 0;\n"
+            "    const walk = (o) => { if (!o.visible) return;\n"
+            "      if (o instanceof Inst) { const live = o.liveInstances();\n"
+            "        if (live > 0) { this.info.render.calls++; this.info.render.triangles += live * 12; } }\n"
+            "      else if (o instanceof Lines) { const c = o.geometry.drawRange.count;\n"
+            "        if (c > 0) { this.info.render.calls++; this.info.render.triangles += c / 2; } }\n"
+            "      else if (o instanceof Pts) { const pos = o.geometry.attributes.position;\n"
+            "        const n = pos ? pos.array.length / 3 : 0; if (n > 0) { this.info.render.calls++; this.info.render.triangles += n; } }\n"
+            "      else this.info.render.calls++; (o.children || []).forEach(walk); }; walk(sc); } }\n"
+            "const THREE = { Scene: function () { scene = new Obj3(); scene.background = null; return scene; },\n"
+            "  PerspectiveCamera: class extends Obj3 { updateProjectionMatrix() {} }, WebGLRenderer: Renderer,\n"
+            "  Vector3: Vec3, Color: Col, Quaternion: class { set() { return this; } }, Matrix4: M4,\n"
+            "  Points: Pts, LineSegments: Lines, InstancedMesh: Inst, BufferGeometry: Geo, BufferAttribute: Attr,\n"
+            "  SphereGeometry: class extends Geo {}, MeshBasicMaterial: Mat, LineBasicMaterial: Mat, PointsMaterial: Mat,\n"
+            "  CanvasTexture: class {}, AdditiveBlending: 2, DynamicDrawUsage: 35048, REVISION: '137-mock', Timer: null };\n"
+            "global.THREE = THREE;\n"
+            "// deterministic clock + frame queue: the test drives every frame itself\n"
+            "let __now = 1000000, __tmpId = 1;\n"
+            "let __queue = [];\n"
+            "global.performance = { now: function () { return __now; } };\n"
+            "global.requestAnimationFrame = function (cb) { const id = __tmpId++; __queue.push({ id: id, cb: cb }); return id; };\n"
+            "global.cancelAnimationFrame = function (id) { __queue = __queue.filter(function (e) { return e.id !== id; }); };\n"
+            "function pump(dt) { const q = __queue; __queue = []; __now += dt; q.forEach(function (e) { e.cb(__now); }); }\n"
+            "function drain(frames, dt) { for (let i = 0; i < frames; i++) pump(dt == null ? 16 : dt); }\n"
+            "const ctx2d = new Proxy({}, { get(t, p) { if (p in t) return t[p];\n"
+            "  const f = () => ({ addColorStop() {} }); t[p] = f; return f; } });\n"
+            "global.document = { hidden: false, visibilityState: 'visible',\n"
+            "  createElement: (t) => t === 'canvas' ? { width: 0, height: 0, getContext: () => ctx2d }\n"
+            "    : { style: {}, addEventListener() {}, removeEventListener() {} },\n"
+            "  addEventListener() {}, removeEventListener() {} };\n"
+            "const ctx = { window: global, document: global.document, console, THREE,\n"
+            "  requestAnimationFrame: global.requestAnimationFrame, cancelAnimationFrame: global.cancelAnimationFrame,\n"
+            "  performance: global.performance, setTimeout: setTimeout, clearTimeout: clearTimeout };\n"
+            "vm.createContext(ctx); ctx.window = ctx; ctx.self = ctx;\n"
+            "vm.runInContext(fs.readFileSync(%r, 'utf8'), ctx);\n"
+            "const R = ctx.GRAFFRiver;\n"
+            "const HOST = { clientWidth: 1280, clientHeight: 720, style: {},\n"
+            "  addEventListener() {}, removeEventListener() {},\n"
+            "  getBoundingClientRect: () => ({ left: 0, top: 0, width: 1280, height: 720 }),\n"
+            "  appendChild() {}, removeChild() {} };\n"
+            "function chain(n) { const out = []; let prev = null;\n"
+            "  const T = ['reason', 'message', 'tool_call', 'tool_result', 'file_edit', 'error'];\n"
+            "  for (let i = 0; i < n; i++) { const id = 'n' + i;\n"
+            "    out.push({ id: id, source: { id: id, ts: 1000 + i, type: T[i %% 6], actor: 'codex', parent: prev,\n"
+            "      label: 'e' + i, meta: { name: 'tool' + i, call_id: 'c' + i } } }); prev = id; }\n"
+            "  return out; }\n"
+            "function feed(river, items) { const m = R.layout(items, true);\n"
+            "  const ls = m.nodes.slice(1).map((n, i) => ({ from: m.nodes[i].id, to: n.id }));\n"
+            "  river.setData(m.nodes, ls, {}); return m; }\n"
+            % self.river
+        ) + payload
+
+    def test_empty_boot_then_data_paints(self):
+        """Boot with no data, park the loop, then push events (the exact failure
+        path of ?mode=river) and require a drawn, non-black frame."""
+        out = self._run("river_paint_boot.js", self._scene_harness(
+            "const river = R.create(HOST, {});\n"
+            "river.renderOnce(); river.start();\n"
+            "drain(3, 16);\n"
+            "const empty = river.stats();\n"
+            "river.stop();\n"
+            "// the loop is now parked on an empty scene; data arrives afterwards\n"
+            "feed(river, chain(300));\n"
+            "drain(2, 16);   // the revived loop paints its own frames\n"
+            "const after = river.stats();\n"
+            "console.log(JSON.stringify({ emptyNodes: empty.nodes, emptyPainted: empty.painted,\n"
+            "  nodes: after.nodes, running: after.running, painted: after.painted,\n"
+            "  triangles: after.triangles, drawCalls: after.drawCalls, frames: after.frames,\n"
+            "  written: river.writtenInstances() }));"))
+        self.assertEqual(out["emptyNodes"], 0)
+        self.assertFalse(out["emptyPainted"], "nothing to paint while the session is empty")
+        self.assertGreater(out["nodes"], 0)
+        self.assertTrue(out["running"], "a data update must bring the render loop back")
+        self.assertTrue(out["painted"], "a real frame must be drawn once data arrives")
+        self.assertGreater(out["triangles"], 0, "the canvas must not stay black")
+        self.assertGreater(out["drawCalls"], 0)
+        self.assertEqual(out["written"], out["nodes"],
+                         "every node needs a matrix or its instance is invisible")
+
+    def test_render_once_forces_a_frame(self):
+        """renderOnce() is the outside hook a diagnostic check can call."""
+        out = self._run("river_paint_once.js", self._scene_harness(
+            "const river = R.create(HOST, {});\n"
+            "feed(river, chain(120));\n"
+            "river.stop();\n"
+            "const before = river.stats();\n"
+            "const drew = river.renderOnce();\n"
+            "const after = river.stats();\n"
+            "console.log(JSON.stringify({ drew: drew, beforeFrames: before.frames,\n"
+            "  afterFrames: after.frames, triangles: after.triangles,\n"
+            "  painted: after.painted, drawCalls: after.drawCalls }));"))
+        self.assertTrue(out["drew"], "renderOnce must report that it drew")
+        self.assertGreater(out["afterFrames"], out["beforeFrames"], "renderOnce must add a drawn frame")
+        self.assertGreater(out["triangles"], 0, "a forced frame must produce geometry")
+        self.assertTrue(out["painted"])
+
+    def test_forced_frame_marks_every_instance(self):
+        """A node written only by the steady pass must still be visible: three's
+        InstancedMesh starts at an all-zero matrix, which draws nothing."""
+        out = self._run("river_paint_instances.js", self._scene_harness(
+            "const river = R.create(HOST, {});\n"
+            "feed(river, chain(400));\n"
+            "river.stop();\n"
+            "river.renderOnce();\n"
+            "const st = river.stats();\n"
+            "console.log(JSON.stringify({ nodes: st.nodes, written: river.writtenInstances(),\n"
+            "  painted: st.painted, triangles: st.triangles }));"))
+        self.assertGreater(out["nodes"], 100)
+        self.assertEqual(out["written"], out["nodes"], "an unwritten instance is an invisible node")
+        self.assertTrue(out["painted"])
+        self.assertGreater(out["triangles"], 0)
+
+    def test_idle_loop_stays_live_but_throttles(self):
+        """An idle scene keeps a correct canvas and stays live, but drops out of
+        the 60 Hz loop instead of burning frames."""
+        out = self._run("river_paint_idle.js", self._scene_harness(
+            "const river = R.create(HOST, {});\n"
+            "feed(river, chain(80));\n"
+            "drain(90, 16);            // let the arrival burst settle (~1.5 s)\n"
+            "const settled = river.stats();\n"
+            "const f0 = settled.frames;\n"
+            "drain(120, 100);          // 12 s of idle time\n"
+            "const idle = river.stats();\n"
+            "console.log(JSON.stringify({ settledIdle: settled.idle, settledPainted: settled.painted,\n"
+            "  tri: idle.triangles, painted: idle.painted, running: idle.running, idle: idle.idle,\n"
+            "  idleMs: idle.idleMs, sparkLimit: idle.sparkLimit,\n"
+            "  idleFrames: idle.frames - f0, idlePumps: 120 }));"))
+        self.assertTrue(out["settledPainted"], "the settled canvas must still hold a frame")
+        self.assertGreater(out["tri"], 0)
+        self.assertTrue(out["painted"])
+        self.assertTrue(out["running"], "an idle river stays live")
+        self.assertTrue(out["idle"], "nothing is animating, so the loop must go idle")
+        self.assertGreater(out["idleMs"], 0, "an idle scene must be throttled, not looped at 60 Hz")
+        self.assertLess(out["idleFrames"], out["idlePumps"],
+                        "idle frames must be fewer than the frames that were pumped")
+        self.assertLessEqual(out["sparkLimit"], 64, "the spark pool must stay bounded")
+
+    def test_paint_surface_is_wired_into_the_loader_paths(self):
+        river = RiverModeTests._read("static", "js", "river.js")
+        app = RiverModeTests._read("static", "js", "app.js")
+        # the module exposes the forced frame + the written-instance census
+        self.assertIn("renderOnce: renderNow", river)
+        self.assertIn("writtenInstances:", river)
+        self.assertIn("function ensureMatrices(", river)
+        self.assertIn("function writeSteady(", river)
+        self.assertIn("IDLE_MS", river)
+        # a data update revives the loop, and both entry paths paint a frame
+        self.assertIn("if (!document.hidden) start();", river)
+        self.assertIn("river.renderOnce();", app)
+        self.assertIn("renderOnce: function () { return (river && river.renderOnce) ? river.renderOnce() : false; }", app)
+        # a parked loop may not leave a stale canvas behind
+        self.assertIn("if (drawFinal !== false && pendingFrame && !document.hidden) renderOnce(nowMs());", river)
+        self.assertIn("stop(false);", river)   # dispose() must not paint
 
 
 class PackagingTests(unittest.TestCase):

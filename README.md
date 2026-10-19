@@ -30,6 +30,7 @@
 - [Live mode and session selection](#live-mode-and-session-selection)
 - [Optional AI enrichment](#optional-ai-enrichment)
 - [Performance notes](#performance-notes)
+- [Modes](#modes)
 - [In-app help](#in-app-help)
 - [Engineering log: what actually broke](#engineering-log-what-actually-broke)
 - [Project layout](#project-layout)
@@ -52,17 +53,21 @@ GRAFF is that idea turned into a small Windows application: one parser, one sock
 
 ## What you get
 
-Two views of the same graph, because one is never enough.
+Three views of the same graph, because one is never enough.
 
 **2D lanes** is the working view. Time runs left to right, event type is a horizontal lane, and arrows cross between lanes. It reads like a sequence diagram of the run: reasoning, terminal, file edits, and errors that throw the agent back. Nodes can be dragged along their lane to untangle long chains, and the offsets are remembered.
 
 **3D neuron brain** is the shape view. The same nodes in three dimensions with a colour gradient over time, cold blue at the start of the session and warm orange at the end, slowly rotating. Green marker on the first node, yellow on the last, so a chain of thousands still has a visible beginning and end.
 
+**River (stream of time)** is the view of the flow itself. The layout is not simulated, it is computed: time runs along the horizontal, branching spreads sideways (the parallel calls of one step), and layers recede into the depth. The ribbon snakes in bands, so a session of thousands of events never becomes one endless line. A node's position is fixed the moment it appears and never changes again -- new events only append at the tail, so movement on screen means time rather than a layout settling. Routine repeats fold into "xN" groups (on by default), a spark runs along every link from cause to effect, and fresh nodes flash as they arrive then slowly cool into a deep blue-violet. The canvas is never left blank: opening `?mode=river` paints a real frame, every node gets its instance matrix written even if it is not being animated, a data update both paints and revives the render loop, and when nothing is left to animate the loop drops to a slow tick instead of stopping dead. The palette is saturated: reasoning purple, tool calls blue, results turquoise, file edits amber, errors red (red is reserved for errors), stream start green, stream end yellow.
+
 ![2D lanes view](docs/screenshots/app-2d.png)
 
 ![3D neuron brain view](docs/screenshots/app-3d.png)
 
-Both views share filters by event type, a text search, a time window, ancestor and descendant path highlighting on click, and export to JSON, GraphML and GEXF.
+![River view, stream of time](docs/screenshots/app-river.png)
+
+All three views share the same filters by event type, text search, time window, click-through details panel, ancestor/descendant path highlighting, and export to JSON, GraphML and GEXF.
 
 ## Architecture
 
@@ -198,7 +203,7 @@ graff/               server and domain logic
   static_files.py    static serving with an explicit MIME table
   enrich.py          optional AI summaries
   ws.py, hub.py      WebSocket plumbing
-static/              frontend: index.html, css, app.js, boot.js, vendored libs
+static/              frontend: index.html, css, app.js, boot.js, river.js, vendored libs
 scripts/             helper tools (demo session, diagram rendering, asset fetch)
 tools/md_to_docx.py  markdown to docx converter used for the article
 tests/               end to end checks against a real rollout
@@ -206,6 +211,16 @@ docs/                article, figures, screenshots
 run.py               entry point
 build.py             PyInstaller build, produces dist/GRAFF.exe
 ```
+
+## Modes
+
+The tabs in the header switch the view; the chosen mode is remembered and restored on the next open. It can also be set from the address: `?mode=2d`, `?mode=3d`, `?mode=river`.
+
+| Mode | What it shows | Layout | Notes |
+|---|---|---|---|
+| 2D lanes | the sequence | lanes (time x type), hierarchy L->R / T->B, free physics | drag a node along its lane |
+| 3D neural brain | the shape of long chains | 3d-force-graph forces | colour by time, start/end markers |
+| River (stream of time) | the flow of time itself | a computed formula, no physics | "xN" groups, sparks along links, cooling |
 
 ## In-app help
 
@@ -219,7 +234,7 @@ The dialog can be opened straight from the URL, without any clicking: `http://12
 python -m unittest discover -s tests -v
 ```
 
-72 checks covering the parser against a real rollout, session selection, session persistence, the API surface, static file MIME handling, the frontend wiring, the rendering modes and the About dialog. All green.
+94 checks covering the parser against a real rollout, session selection, session persistence, the API surface, static file MIME handling, the frontend wiring, the rendering modes and the About dialog. All green.
 
 ## Documentation
 

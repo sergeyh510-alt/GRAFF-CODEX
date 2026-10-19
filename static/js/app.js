@@ -1,8 +1,9 @@
 /* GRAFF frontend - live Codex reasoning graph.
  *
- * One data model (rawNodes / rawOrder / edgeList), two renderers:
- *   2D vis-network  -> "lanes" (time x type), hierarchy, physics
- *   3D 3d-force-graph -> "neural brain" (glowing spheres, time gradient)
+ * One data model (rawNodes / rawOrder / edgeList), three renderers:
+ *   2D vis-network     -> "lanes" (time x type), hierarchy, physics
+ *   3D 3d-force-graph  -> "neural brain" (glowing spheres, time gradient)
+ *   river (three.js)   -> computed stream of time (see static/js/river.js)
  *
  * Derived view: type/actor/time filters, search highlighting,
  * ancestor/descendant path highlighting, optional tool_call -> tool_result
@@ -96,6 +97,11 @@
     tool_result: "result", file_edit: "edit", error: "error"
   };
 
+  // ---- river (computed stream of time) ---- #
+  var RIVER_MAX_NODES = 4000;      // hard cap for the river scene
+  var RIVER_FOLLOW_MS = 2200;      // camera follow: at most one flight in a while
+  var RIVER_REFRESH_MS = 900;      // min ms between river rebuilds
+
   var STORE_KEY = "graff.ui.v2";
 
   // ------------------------------------------------------------------ //
@@ -145,12 +151,19 @@
     linkWidth: false,     // 3D: thick links (per-link meshes -> costly)
     linkCurve: false,     // 3D: curved links (more geometry per link)
     markers: true,        // 3D: chain start/end pointer markers (on by default)
-    laneShifts: {}        // 2D lanes: manual per-node horizontal offsets (id -> dx)
+    laneShifts: {},       // 2D lanes: manual per-node horizontal offsets (id -> dx)
+    riverCollapse: true,  // river: fold routine repeats into "xN" groups
+    riverFollow: true,    // river: camera follows the newest node
+    riverLinks: true      // river: draw the causal links
   };
 
   var status = { startedWall: Date.now(), counts: {} };
   var sessions = [];
   var currentSession = null;
+
+  var river = null;            // GRAFFRiver scene instance (river mode)
+  var riverLoad = null;        // in-flight three.js load for the river scene
+  var riverBuildLimit = 0;     // nodes actually pushed into the river scene
 
   var rotateTimer = null;
   var manualRotateTimer = null;
@@ -383,6 +396,8 @@
 
     if (state.mode === "3d") {
       sync3d();
+    } else if (state.mode === "river") {
+      syncRiver();
     } else {
       if (state.layout === "lanes") { positionLanes(); appendEdgeLabels(); }
       if (state.follow) scheduleFit();
@@ -818,6 +833,8 @@
     if (state.mode === "3d") {
       glHighlight3d();
       if (opts && opts.fly) glFlyTo(viewId);
+    } else if (state.mode === "river") {
+      riverFocus(viewId);
     } else if (network) {
       network.selectNodes([viewId]);
       if (!(opts && opts.noFocus)) {
@@ -972,7 +989,12 @@
 
     recomputeWindow();
     render();
-    if (state.mode !== "3d" && state.follow) focusLatest(true);
+    if (state.mode === "river") {
+      // a "step finished" crest rolls along the newest part of the chain
+      riverCrest();
+    } else if (state.follow) {
+      focusLatest(true);
+    }
     if (state.selected && nodes.get(state.selected)) selectNode(state.selected);
   }
 
@@ -1011,6 +1033,7 @@
     recomputeMatches();
     applyViewState();
     if (state.mode === "3d") glHighlight3d();
+    if (state.mode === "river") syncRiver(true);
   }
   // ------------------------------------------------------------------ //
   // status, counters, legend, sessions
@@ -1136,6 +1159,7 @@
     if (chip) chip.setAttribute("data-on", enabledTypes[type] ? "true" : "false");
     applyViewState();
     if (state.mode === "3d") sync3d();
+    if (state.mode === "river") syncRiver(true);
     if (state.mode === "2d" && state.layout === "lanes") applyLayout();
   }
 
@@ -2028,7 +2052,15 @@
     var mode = state.perf ? "производительность" : "качество";
     var r = rendererInfo();
     var parts;
-    if (state.mode === "3d") {
+    if (state.mode === "river") {
+      var rs = (river && river.stats) ? river.stats() : { nodes: 0, links: 0, drawCalls: 0, triangles: 0, fps: 0, frameMs: 0 };
+      parts = ["Русло · " + mode,
+        "узлов " + rs.nodes + " / связей " + rs.links,
+        "draw calls " + rs.drawCalls,
+        "треугольников " + fmtInt(rs.triangles),
+        (rs.fps ? "~" + rs.fps + " fps" : "~— fps"),
+        "кадр " + (rs.frameMs ? rs.frameMs + " мс" : "—")];
+    } else if (state.mode === "3d") {
       parts = ["3D · " + mode,
         "узлов " + glNodeCount + " / связей " + glLinkCount,
         "draw calls " + r.calls,
@@ -2049,9 +2081,9 @@
     setText("gl-calls", String(r.calls));
     setText("gl-tris", fmtInt(r.triangles));
     // What is really active right now, so the modes are visibly different.
-    setText("gl-mode", state.mode === "3d" ? "3D" : "2D-дорожки");
-    setText("gl-layout", state.mode === "3d" ? "—" : state.layout);
-    setText("gl-physics", state.mode === "3d" ? "—" : (state.layout === "physics" ? "вкл" : "выкл"));
+    setText("gl-mode", state.mode === "3d" ? "3D" : (state.mode === "river" ? "Русло" : "2D-дорожки"));
+    setText("gl-layout", state.mode === "2d" ? state.layout : "—");
+    setText("gl-physics", state.mode === "2d" ? (state.layout === "physics" ? "вкл" : "выкл") : "—");
   }
 
   function setText(id, value) { var n = $(id); if (n) n.textContent = value; }
@@ -2138,6 +2170,12 @@
     });
     if (updates.length) nodes.update(updates);
     if (state.mode === "3d") { apply3dPerf(); sync3d(true); }
+    if (state.mode === "river") {
+      applyRiverPrefs();
+      // performance mode switches the spark animation off entirely
+      if (state.perf && river) river.clearSparks();
+      renderRiverDiag();
+    }
     updatePerfNote();
     if (announce) toast(state.perf ? "Режим производительности" : "Режим качества");
   }
@@ -2315,6 +2353,246 @@
     try { gl.zoomToFit(700, 60); } catch (e) {}
   }
   // ------------------------------------------------------------------ //
+  // river mode: the session as a computed stream of time (three.js)
+  // ------------------------------------------------------------------ //
+  // Everything here is additive: the 2D vis-network graph and the 3D
+  // 3d-force-graph scene are untouched and keep working exactly as before.
+
+  function riverReady() { return !!(window.GRAFFRiver && river); }
+
+  function riverWanted() {
+    return state.mode === "river" && !!river && !document.hidden;
+  }
+
+  function ensureRiver() {
+    if (river) return Promise.resolve(river);
+    if (!window.GRAFFRiver) return Promise.reject(new Error("river.js не загрузился"));
+    return ensureThree().then(function () {
+      if (river) return river;
+      var host = $("river3d");
+      if (!host) throw new Error("нет контейнера #river3d");
+      river = window.GRAFFRiver.create(host, { perf: state.perf });
+      buildRiverLegend();
+      return river;
+    });
+  }
+
+  // The river shows the same derived view as the other two modes (filters,
+  // window, search, path highlighting all apply), packed into "xN" groups.
+  function riverItems() {
+    return buildView();
+  }
+
+  function riverNodeIds(items) {
+    var ids = {};
+    for (var i = 0; i < items.length; i++) ids[items[i].id] = true;
+    return ids;
+  }
+
+  // Map an edge of the derived view onto the river ids of its endpoints.
+  function riverLinkEnds(edge, byRaw) {
+    var a = byRaw[edge.from], b = byRaw[edge.to];
+    if (!a || !b || a.id === b.id) return null;
+    return { from: a.id, to: b.id };
+  }
+
+  var lastRiverAt = 0;
+  var lastRiverSig = null;
+
+  function syncRiver(force) {
+    if (!river || state.mode !== "river") return;
+    if (!force) {
+      var now = Date.now();
+      if (now - lastRiverAt < RIVER_REFRESH_MS) return;
+      lastRiverAt = now;
+    }
+    var items = riverItems();
+    var source = [];
+    for (var i = 0; i < items.length; i++) {
+      var nd = nodes.get(items[i].id);
+      if (!nd || nd.hidden) continue;
+      source.push(items[i]);
+    }
+    // Hard cap: never push more than RIVER_MAX_NODES into the scene.  The items
+    // are ordered by time, so the newest ones are the ones kept.
+    var capped = source;
+    if (source.length > RIVER_MAX_NODES) capped = source.slice(source.length - RIVER_MAX_NODES);
+
+    var m = window.GRAFFRiver.layout(capped, state.riverCollapse);
+    var byRaw = {};
+    for (var k = 0; k < m.nodes.length; k++) {
+      var ids = m.nodes[k].rawIds;
+      for (var r = 0; r < ids.length; r++) byRaw[ids[r]] = m.nodes[k];
+    }
+    var links = [];
+    if (state.riverLinks) {
+      for (var e = 0; e < edgeList.length; e++) {
+        var ends = riverLinkEnds(edgeList[e], byRaw);
+        if (ends) links.push(ends);
+      }
+    }
+
+    var sig = m.nodes.length + ":" + links.length + ":" +
+      (m.nodes.length ? m.nodes[m.nodes.length - 1].id : "") + ":" + (state.riverLinks ? 1 : 0);
+    if (!force && sig === lastRiverSig) { renderRiverDiag(); return; }
+    lastRiverSig = sig;
+
+    riverBuildLimit = m.nodes.length;
+    var res = river.setData(m.nodes, links, { silent: !force && m.nodes.length > 400 });
+    // data changed while the mode is on screen -> bring the loop back and paint
+    // one frame, so a session opened by address wakes up on the first update
+    if (state.mode === "river" && !document.hidden) {
+      river.renderOnce();
+      river.start();
+    }
+    if (state.riverFollow && res && res.indices && res.indices.length && state.mode === "river") {
+      riverFollowIfWanted();
+    }
+    if (res && res.indices && res.indices.length && state.mode === "river") {
+      // performance mode: no spark animation, only the appearance flash
+      if (!state.perf) river.spawnSparks(res.indices);
+      if (res.first) river.fit(false);
+    }
+    if (state.pathNodes) riverHighlight();
+    renderRiverDiag();
+  }
+
+  function riverHighlight() {
+    // the river draws its own colours; the path is shown by the shared details
+    // panel and by the 2D/3D views.  Here we only pull the camera to the node.
+    return true;
+  }
+
+  function buildRiverLegend() {
+    var list = $("legend-river");
+    if (!list) return;
+    var R = window.GRAFFRiver;
+    if (!R) return;
+    list.innerHTML = "";
+    var entries = [
+      { color: R.palette.reason, label: "рассуждение" },
+      { color: R.palette.message, label: "сообщение" },
+      { color: R.palette.tool_call, label: "вызов инструмента" },
+      { color: R.palette.tool_result, label: "результат" },
+      { color: R.palette.file_edit, label: "правка файла" },
+      { color: R.palette.error, label: "ошибка" },
+      { color: R.palette.start, label: "начало потока" },
+      { color: R.palette.end, label: "конец потока" },
+      { color: R.palette.cold, label: "давнее событие (остывает)" }
+    ];
+    for (var i = 0; i < entries.length; i++) {
+      var item = el("li");
+      var dot = el("span", "dot-glow");
+      dot.style.color = entries[i].color;
+      item.appendChild(dot);
+      item.appendChild(el("span", "lname", entries[i].label));
+      list.appendChild(item);
+    }
+  }
+
+  function renderRiverDiag() {
+    if (state.mode !== "river") return;
+    var R = window.GRAFFRiver;
+    var st = (river && river.stats) ? river.stats() : { nodes: 0, links: 0, drawCalls: 0, triangles: 0, fps: 0, frameMs: 0 };
+    var grouped = 0;
+    if (river && river.nodes) {
+      var list = river.nodes();
+      for (var i = 0; i < list.length; i++) if (list[i].count > 1) grouped++;
+    }
+    setText("river-counts", st.nodes + " / " + st.links);
+    setText("river-groups", grouped + " групп");
+    setText("river-fps", st.fps ? ("~" + st.fps) : "—");
+    setText("river-frame", st.frameMs ? (st.frameMs + " мс") : "—");
+    setText("river-calls", String(st.drawCalls));
+    setText("river-tris", fmtInt(st.triangles));
+    setText("river-mode", "Русло · поток времени");
+    var liveSparks = 0;
+    if (river && river.sparkStats) liveSparks = river.sparkStats();
+    setText("river-sparks", liveSparks + " / " + (window.GRAFFRiver ? window.GRAFFRiver.constants.SPARK_POOL : 0));
+    var note = $("river-note");
+    if (note) {
+      var raw = rawOrder.length;
+      var parts = [];
+      if (state.riverCollapse) parts.push("повторы свёрнуты в группы");
+      if (raw > RIVER_MAX_NODES) parts.push("показаны последние " + RIVER_MAX_NODES + " узлов из " + raw);
+      var noteText = parts.join(" · ");
+      note.textContent = noteText;
+    }
+    renderPerfNote();
+  }
+
+  function startRiver() {
+    ensureRiver().then(function () {
+      if (state.mode !== "river") return;
+      stop3d();
+      applyRiverPrefs();
+      river.resize(($("river3d") || {}).clientWidth || 800, ($("river3d") || {}).clientHeight || 600);
+      syncRiver(true);
+      river.fit(false);
+      // paint immediately: a mode opened straight from the address must show a
+      // frame even if the graph is still empty and no data has arrived yet
+      river.renderOnce();
+      river.start();
+    }).catch(function (err) {
+      pushLog("• русло: " + (err && err.message ? err.message : String(err)));
+      toast("Русло: " + (err && err.message ? err.message : "сцена не поднялась"));
+    });
+  }
+
+  function stopRiver() {
+    if (river) {
+      // stop() draws the owed frame before parking, so leaving the tab never
+      // leaves a black canvas behind
+      river.stop();
+      river.clearSparks();
+    }
+  }
+
+  function applyRiverPrefs() {
+    if (!river) return;
+    river.setPixelRatio(state.perf ? 1 : (window.devicePixelRatio || 1));
+    if (river.setLinksVisible) river.setLinksVisible(!!state.riverLinks);
+  }
+
+  function riverFollowIfWanted() {
+    if (state.mode === "river" && state.riverFollow && river) river.followLatest(true);
+  }
+
+  function riverFit() { if (river) river.fit(true); }
+
+  function riverFocus(viewId) {
+    if (!river) return;
+    var node = nodes.get(viewId);
+    if (!node) return;
+    if (river.focusNode(node.id, true)) river.wake(700);
+  }
+
+  // The river reacts to a click by selecting the node (details + path), exactly
+  // like the other two modes.
+  function riverClick() {
+    var host = $("river3d");
+    if (!host) return;
+    host.addEventListener("click", function (ev) {
+      if (!river || state.mode !== "river") return;
+      var rect = host.getBoundingClientRect();
+      var hit = river.pick(ev.clientX - rect.left, ev.clientY - rect.top, rect.width, rect.height);
+      if (!hit) { state.selected = null; clearSelection(); return; }
+      selectNode(hit.id);
+      if (state.riverFollow) riverFocus(hit.id);
+    });
+  }
+
+  // A "step finished" crest: the tail of the chain gets a short wave of light.
+  function riverCrest() {
+    if (state.mode !== "river" || !river) return 0;
+    var list = river.nodes();
+    var from = Math.max(0, list.length - 60);
+    var idx = [];
+    for (var i = from; i < list.length; i++) idx.push(i);
+    return river.crest(idx);
+  }
+
+  // ------------------------------------------------------------------ //
   // mode switching + preferences
   // ------------------------------------------------------------------ //
   function updateModeTabs() {
@@ -2327,9 +2605,10 @@
   function updatePanels() {
     var layoutPanel = $("panel-layout");
     var panel3d = $("panel-3d");
-    var is3d = state.mode === "3d";
-    if (layoutPanel) layoutPanel.hidden = is3d;
-    if (panel3d) panel3d.hidden = !is3d;
+    var panelRiver = $("panel-river");
+    if (layoutPanel) layoutPanel.hidden = state.mode === "3d" || state.mode === "river";
+    if (panel3d) panel3d.hidden = state.mode !== "3d";
+    if (panelRiver) panelRiver.hidden = state.mode !== "river";
   }
 
   // ------------------------------------------------------------------ //
@@ -2366,10 +2645,35 @@
 
   function switchMode(mode) {
     if (mode === state.mode) return;
+    var was = state.mode;
     state.mode = mode;
     var canvas = $("stage-canvas");
     var glbox = $("gl3d");
+    var riverbox = $("river3d");
     var mini = $("minimap");
+
+    // leaving any mode: stop whatever that mode was running, so no timer from
+    // one view can survive into another
+    if (was === "3d") stop3d();
+    if (was === "river") stopRiver();
+
+    if (mode === "river") {
+      if (glbox) glbox.hidden = true;
+      if (mini) mini.hidden = true;
+      canvas.hidden = true;
+      if (riverbox) riverbox.hidden = false;
+      updateModeTabs();
+      updatePanels();
+      startRiver();
+      render();
+      startFpsMeter();
+      sampleFps();
+      savePrefs();
+      updateRotateButton();
+      return;
+    }
+    if (riverbox) riverbox.hidden = true;
+    $("missing-3d").hidden = true;
 
     if (mode === "3d") {
       if (!state.collapse) {
@@ -2421,7 +2725,10 @@
         linkWidth: state.linkWidth,
         linkCurve: state.linkCurve,
         markers: state.markers,
-        laneShifts: state.laneShifts
+        laneShifts: state.laneShifts,
+        riverCollapse: state.riverCollapse,
+        riverFollow: state.riverFollow,
+        riverLinks: state.riverLinks
       }));
     } catch (e) { /* storage disabled */ }
   }
@@ -2429,7 +2736,7 @@
   function modeFromUrl() {
     try {
       var m = new URLSearchParams(location.search).get("mode");
-      if (m === "2d" || m === "3d") return m;
+      if (m === "2d" || m === "3d" || m === "river") return m;
     } catch (e) {}
     return null;
   }
@@ -2444,7 +2751,7 @@
     if (p.mode === "float") {
       state.mode = "2d";
       savePrefs();
-    } else if (p.mode === "2d" || p.mode === "3d") {
+    } else if (p.mode === "2d" || p.mode === "3d" || p.mode === "river") {
       state.mode = p.mode;
     }
     if (LAYOUT_LIST.indexOf(p.layout) >= 0) state.layout = p.layout;
@@ -2460,6 +2767,9 @@
     if (typeof p.linkWidth === "boolean") state.linkWidth = p.linkWidth;
     if (typeof p.linkCurve === "boolean") state.linkCurve = p.linkCurve;
     if (typeof p.markers === "boolean") state.markers = p.markers;
+    if (typeof p.riverCollapse === "boolean") state.riverCollapse = p.riverCollapse;
+    if (typeof p.riverFollow === "boolean") state.riverFollow = p.riverFollow;
+    if (typeof p.riverLinks === "boolean") state.riverLinks = p.riverLinks;
     if (p.laneShifts && typeof p.laneShifts === "object") {
       // keep only finite numbers, so a corrupt entry cannot push a node away
       for (var sid in p.laneShifts) {
@@ -2488,6 +2798,9 @@
     set("gl-thick-links", state.linkWidth);
     set("gl-curved-links", state.linkCurve);
     set("gl-markers", state.markers);
+    set("river-collapse", state.riverCollapse);
+    set("river-follow", state.riverFollow);
+    set("river-links", state.riverLinks);
     var slider = $("time-window");
     if (slider) {
       var idx = 0;
@@ -2613,12 +2926,14 @@
       recomputeWindow();
       applyViewState();
       if (state.mode === "3d") sync3d();
+      if (state.mode === "river") syncRiver(true);
     });
 
     $("filter-actors").addEventListener("change", function (e) {
       state.hideUser = e.target.checked;
       applyViewState();
       if (state.mode === "3d") sync3d();
+      if (state.mode === "river") syncRiver(true);
       savePrefs();
     });
 
@@ -2704,6 +3019,32 @@
     });
     if ($("btn-reset-shifts")) $("btn-reset-shifts").addEventListener("click", resetLaneShifts);
 
+    // ---- river mode controls ---- //
+    if ($("river-collapse")) $("river-collapse").addEventListener("change", function (e) {
+      state.riverCollapse = e.target.checked;
+      lastRiverSig = null;
+      if (state.mode === "river") syncRiver(true);
+      savePrefs();
+    });
+    if ($("river-follow")) $("river-follow").addEventListener("change", function (e) {
+      state.riverFollow = e.target.checked;
+      if (state.riverFollow && state.mode === "river") riverFollowIfWanted();
+      savePrefs();
+    });
+    if ($("river-links")) $("river-links").addEventListener("change", function (e) {
+      state.riverLinks = e.target.checked;
+      lastRiverSig = null;
+      if (state.mode === "river") { syncRiver(true); applyRiverPrefs(); }
+      savePrefs();
+    });
+    if ($("btn-river-fit")) $("btn-river-fit").addEventListener("click", riverFit);
+    if ($("btn-river-latest")) $("btn-river-latest").addEventListener("click", function () {
+      if (state.mode !== "river") return;
+      if (state.lastNodeId) riverFocus(viewMapReverse[state.lastNodeId] || state.lastNodeId);
+      else riverFollowIfWanted();
+      river.wake(800);
+    });
+
     $("missing-3d-retry").addEventListener("click", function () {
       hide3dError();
       glLog = [];
@@ -2760,6 +3101,23 @@
     });
   }
 
+  // Keyboard: F fits whatever view is active, R refits the river, L follows the
+  // newest node.  Kept deliberately small and only while no field has focus.
+  function onKeydownShortcuts(e) {
+    if (e.ctrlKey || e.metaKey || e.altKey) return;
+    var tag = (e.target && e.target.tagName) ? String(e.target.tagName).toLowerCase() : "";
+    if (tag === "input" || tag === "select" || tag === "textarea") return;
+    if (aboutIsOpen()) return;
+    var key = String(e.key || "").toLowerCase();
+    if (key === "r" && state.mode === "river") { riverFit(); }
+    else if (key === "l") { if (state.mode === "river") { riverFollowIfWanted(); if (river) river.wake(700); } else focusLatest(true); }
+    else if (key === "f") {
+      if (state.mode === "river") riverFit();
+      else if (state.mode === "3d") fit3d();
+      else if (network) network.fit({ animation: true });
+    }
+  }
+
   function gotoFirstMatch() {
     if (!state.matches) return;
     for (var id in state.matches) {
@@ -2805,13 +3163,17 @@
     updateRotateButton();
 
     var is3d = state.mode === "3d";
-    $("stage-canvas").hidden = is3d;
+    var isRiver = state.mode === "river";
+    $("stage-canvas").hidden = is3d || isRiver;
     $("gl3d").hidden = !is3d;
-    $("minimap").hidden = is3d;
+    if ($("river3d")) $("river3d").hidden = !isRiver;
+    $("minimap").hidden = is3d || isRiver;
     $("graph-waiting").hidden = false;
     $("graph-empty").hidden = true;
+    if (isRiver) buildRiverLegend();
 
     if (is3d) { render(); start3d(); }
+    else if (isRiver) { render(); startRiver(); }
     else {
       applyLayout();
     }
@@ -2824,12 +3186,16 @@
 
     // Pause all animation while the tab is hidden (browser + 3D).
     document.addEventListener("visibilitychange", onVisibilityChange);
+    document.addEventListener("keydown", onKeydownShortcuts);
+    riverClick();
 
     connect();
     setInterval(tickUptime, 1000);
     setInterval(function () { send({ type: "ping", t: Date.now() }); }, 15000);
     setInterval(drawMinimap, 4000);
     setInterval(function () { if (state.mode === "3d") sync3d(false); }, 4000);
+    setInterval(function () { if (state.mode === "river") syncRiver(false); }, 4000);
+    setInterval(function () { if (state.mode === "river") renderRiverDiag(); }, 2000);
     fetch("/api/sessions").then(function (r) { return r.json(); }).then(function (d) { applySessions(d.sessions || []); }).catch(failSafe("sessions"));
     fetch("/api/ai").then(function (r) { return r.json(); }).then(applyAiStatus).catch(failSafe("ai"));
     fetch("/api/state").then(function (r) { return r.json(); }).then(function (d) {
@@ -2846,6 +3212,7 @@
       // Freeze everything while the tab is hidden (no CPU/GPU burn).
       stopRotate();
       stopMarkerTimer();
+      stopRiver();
       if (gl) { try { if (gl.pauseAnimation) gl.pauseAnimation(); } catch (e) {} }
       stopFpsMeter();
     } else {
@@ -2854,6 +3221,11 @@
         sync3d(true);
         if (wantRotate()) startRotate(); else stopRotate();
         startMarkerTimer();
+      }
+      if (state.mode === "river" && river) {
+        applyRiverPrefs();
+        syncRiver(true);
+        river.start();
       }
       startFpsMeter();
       sampleFps();
@@ -2911,6 +3283,38 @@
       return { start: snap(markerStart, MARKER_GREEN), end: snap(markerEnd, MARKER_YELLOW) };
     },
     about: { open: aboutOpen, close: aboutClose, isOpen: aboutIsOpen, fromUrl: aboutFromUrl },
+    // river mode: the pure model plus the live scene
+    river: {
+      model: function () { return window.GRAFFRiver ? {
+        palette: window.GRAFFRiver.palette,
+        constants: window.GRAFFRiver.constants
+      } : null; },
+      layout: function (items, collapse) {
+        return window.GRAFFRiver ? window.GRAFFRiver.layout(items, collapse) : null;
+      },
+      packRuns: function (items, collapse) {
+        return window.GRAFFRiver ? window.GRAFFRiver.packRuns(items, collapse) : null;
+      },
+      coordsFor: function (slot) { return window.GRAFFRiver.coordsFor(slot); },
+      ready: function () { return !!river; },
+      build: function () { return ensureRiver().then(function () { return true; }); },
+      sync: function () { syncRiver(true); renderRiverDiag(); return !!river; },
+      stats: function () { return (river && river.stats) ? river.stats() : null; },
+      // force exactly one frame from outside (diagnostics / automated checks)
+      renderOnce: function () { return (river && river.renderOnce) ? river.renderOnce() : false; },
+      written: function () { return (river && river.writtenInstances) ? river.writtenInstances() : 0; },
+      positions: function () { return (river && river.positions) ? river.positions() : {}; },
+      positionOf: function (id) { return (river && river.positionOf) ? river.positionOf(id) : null; },
+      nodes: function () { return (river && river.nodes) ? river.nodes() : []; },
+      fit: function () { riverFit(); },
+      follow: function () { riverFollowIfWanted(); },
+      crest: riverCrest,
+      // place the camera on a node by its raw id / view id
+      focus: function (viewId) { riverFocus(viewId); return true; },
+      pool: function () { return (river && river.sparkStats) ? river.sparkStats() : 0; },
+      limits: function () { return { maxNodes: RIVER_MAX_NODES, refreshMs: RIVER_REFRESH_MS, followMs: RIVER_FOLLOW_MS }; }
+    },
+    buildRiverLegend: buildRiverLegend,
     laneShifts: function () {
       var out = {};
       for (var k in state.laneShifts) if (state.laneShifts.hasOwnProperty(k)) out[k] = state.laneShifts[k];

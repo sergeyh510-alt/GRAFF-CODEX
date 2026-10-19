@@ -36,6 +36,18 @@
   }
 
   function startApp() {
+    // The river mode ships as its own file next to app.js.  It is a plain
+    // module (window.GRAFFRiver) with no dependencies of its own, so loading it
+    // before app.js is enough; a failure here must not stop the other two
+    // views, which is why the error is only recorded.
+    var extra = document.createElement("script");
+    extra.src = "/static/js/river.js?v=" + VERSION;
+    extra.async = false;
+    extra.onerror = function () {
+      record("river.js", extra.src, "ошибка загрузки (режим «Русло» будет недоступен)");
+    };
+    document.body.appendChild(extra);
+
     var s = document.createElement("script");
     s.src = "/static/js/app.js";
     s.async = false;
