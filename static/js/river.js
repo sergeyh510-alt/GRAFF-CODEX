@@ -432,10 +432,15 @@ window.GRAFFRiver = (function () {
       shader.vertexShader = "uniform float uGrow;\n" + shader.vertexShader.replace(
         "#include <begin_vertex>", "#include <begin_vertex>\n\ttransformed *= uGrow;");
       shader.uniforms.uGrow = { value: HALO_GROW };
+      // GUARDED on purpose.  vColor only EXISTS when three emitted USE_COLOR /
+      // USE_COLOR_ALPHA; an unguarded reference is an undeclared identifier and
+      // fails the whole program ("Shader Error 0 - VALIDATE_STATUS false"),
+      // which is what left the canvas black while every counter looked sane.
       shader.fragmentShader = shader.fragmentShader.replace(
         "#include <color_fragment>",
-        "#include <color_fragment>\n\tfloat g = clamp(dot(vColor.rgb, vec3(0.6, 0.3, 0.1)) * 1.2, 0.45, 1.25);\n" +
-        "\tdiffuseColor.a *= g;");
+        "#include <color_fragment>\n#if defined( USE_COLOR_ALPHA ) || defined( USE_COLOR )\n" +
+        "\tfloat g = clamp(dot(vColor.rgb, vec3(0.6, 0.3, 0.1)) * 1.2, 0.45, 1.25);\n" +
+        "\tdiffuseColor.a *= g;\n#endif");
     };
     return mat;
   }
@@ -538,6 +543,9 @@ window.GRAFFRiver = (function () {
       try {
         renderer = new THREE_.WebGLRenderer({ antialias: !opts.perf, alpha: false });
         renderer.setClearColor(0x04070c, 1);
+        // Keep three's program checking ON (it is the only thing that turns a
+        // silent "shader did not compile" into a programLog we can report).
+        if (renderer.debug) renderer.debug.checkShaderErrors = true;
         // Preflight: an untouched GL canvas shows whatever the driver left in
         // it (usually black/transparent).  Clearing once right here means the
         // very first visible state is the scene background, never a blank slate.
@@ -569,6 +577,11 @@ window.GRAFFRiver = (function () {
     var haloMat = haloMaterial(THREE_, dpr);
     var halos = new THREE_.InstancedMesh(coreGeo, haloMat, MAX_NODES);
     halos.instanceMatrix = cores.instanceMatrix;   // shared: uploaded once
+    // Share the colour buffer too: the halo then glows in the NODE'S OWN hue
+    // (an error blooms red, a message white) and, just as important, three
+    // defines USE_INSTANCING_COLOR for this material, which is the define that
+    // makes "varying vec3 vColor" exist for the fragment stage above.
+    halos.instanceColor = cores.instanceColor;
     halos.count = 0;
     halos.frustumCulled = false;
     halos.renderOrder = 2;
@@ -1253,9 +1266,13 @@ window.GRAFFRiver = (function () {
       var out = {
         supported: false, width: CHECK_W, height: CHECK_H,
         nonBlack: 0, hues: 0, linePixels: 0, nodesInFrame: 0,
-        winding: linkWindingOk, dangling: dangling
+        winding: linkWindingOk, dangling: dangling,
+        // `reason` is the whole point of this method: "supported: false" must
+        // never be a bare zero, it must NAME what is wrong (a program that did
+        // not compile, or a drawn frame that came back empty).
+        reason: "", shaderErrors: shaderErrors, shaderLog: shaderLog
       };
-      if (!renderer) return out;
+      if (!renderer) { out.reason = "нет WebGL-рендерера"; return out; }
       try {
         ensureCheckTargets();
         // size the check exactly like the visible canvas, so the projection and
@@ -1320,13 +1337,34 @@ window.GRAFFRiver = (function () {
           var mx = Math.max(r, g, b), mn = Math.min(r, g, b);
           if (mx < 250 && mn > 0 && lum < 700 && (mx - mn) < 160) linePixels++;
         }
-        out.supported = true;
         out.nonBlack = nonBlack;
         out.hues = hues;
         out.linePixels = linePixels;
         out.width = CHECK_W; out.height = CHECK_H;
         out.winding = linkWindingOk;
         out.dangling = dangling;
+
+        // A program that failed to link means NOTHING on this canvas is real:
+        // say so instead of returning the zeroes as if the check had passed.
+        var bad = inspectPrograms();
+        out.shaderErrors = bad;
+        out.shaderLog = shaderLog;
+        if (bad > 0) {
+          out.supported = false;
+          out.reason = "шейдер не собрался (" + bad + " программа): " + (shaderLog || "нет лога драйвера");
+          lastCheck = out;
+          return out;
+        }
+        // The scene has nodes but the frame came back black: that is a failure
+        // of the picture, not a pass, and it has to be reported as one.
+        if (sceneNodes > 0 && nonBlack === 0) {
+          out.supported = false;
+          out.reason = "кадр пуст: " + sceneNodes + " узлов в сцене, но ни одного непустого пикселя";
+          lastCheck = out;
+          return out;
+        }
+        out.supported = true;
+        out.reason = "";
 
         // nodes in frame: the same projection the picker uses
         var inFrame = 0;
@@ -1655,6 +1693,43 @@ window.GRAFFRiver = (function () {
       return (window.performance && window.performance.now) ? window.performance.now() : Date.now();
     }
 
+    /* Walk renderer.info.programs (three keeps the live programs there) and
+       collect the ones that did NOT link.  Reading `diagnostics.runnable` is
+       how three itself expresses "this program is unusable"; the programLog and
+       the per-stage logs carry the real driver message, so that is what we
+       report.  Called on the first frames and by selfCheck(); it never
+       allocates while the scene is healthy. */
+    var shaderErrors = 0;      // distinct broken programs seen
+    var shaderLog = "";        // the driver's own message, for the journal
+    var shaderChecked = false; // at least one inspection ran
+    function inspectPrograms() {
+      shaderChecked = true;
+      var list = null;
+      try { list = renderer && renderer.info && renderer.info.programs; } catch (e) { list = null; }
+      if (!list || !list.length) return 0;
+      var bad = 0, log = "";
+      for (var i = 0; i < list.length; i++) {
+        var pr = list[i];
+        var diag = pr && pr.diagnostics;
+        // No diagnostics object means three could not even build the program.
+        var ok = diag ? diag.runnable !== false : true;
+        if (ok) continue;
+        bad++;
+        if (!log) {
+          log = (diag && diag.programLog ? diag.programLog : "") ;
+          if (diag && diag.vertexShader && diag.vertexShader.log) log += " | vertex: " + diag.vertexShader.log;
+          if (diag && diag.fragmentShader && diag.fragmentShader.log) log += " | fragment: " + diag.fragmentShader.log;
+          if (!log) log = "программа не собралась (нет diagnostics)";
+        }
+      }
+      if (bad && bad !== shaderErrors) {
+        shaderErrors = bad;
+        shaderLog = log;
+        warn("русло: шейдер не собрался — " + bad + " программа(ы): " + log);
+      }
+      return bad;
+    }
+
     function renderOnce(now) {
       if (typeof now !== "number") now = nowMs();
       var t0 = nowMs();
@@ -1701,6 +1776,10 @@ window.GRAFFRiver = (function () {
           drawCalls = info.calls || 0;
           triangles = info.triangles || 0;
         } catch (e) {}
+        // Right after a draw three has built (or reused) every program, so this
+        // is the moment a compile failure can be caught.  A healthy scene pays
+        // one array walk once.
+        if (!shaderChecked) inspectPrograms();
         var ms = nowMs() - t0;                  // CPU cost of the JS pass
         if (ms > frameMsMax) frameMsMax = ms;   // absolute worst pass seen
         frameMsSum += ms;
@@ -1946,7 +2025,15 @@ window.GRAFFRiver = (function () {
         checkLines: lastCheck ? lastCheck.linePixels : 0,
         checkNodes: lastCheck ? lastCheck.nodesInFrame : 0,
         checkSize: lastCheck ? (lastCheck.width + "x" + lastCheck.height) : "",
-        checkError: lastCheck && lastCheck.error ? lastCheck.error : null
+        checkError: lastCheck && lastCheck.error ? lastCheck.error : null,
+        // The honest verdict of the pixel check: `checkSupported` is false not
+        // only when the check could not run, but also when the program did not
+        // compile or the frame came back empty - and then `checkReason` says
+        // why.  That is what stops a black canvas from reading as "healthy".
+        checkReason: lastCheck && lastCheck.reason ? lastCheck.reason : "",
+        shaderErrors: shaderErrors,
+        shaderLog: shaderLog,
+        shaderChecked: shaderChecked
       };
     }
 

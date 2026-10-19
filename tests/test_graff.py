@@ -2144,5 +2144,147 @@ class LaneShiftTests(unittest.TestCase):
         self.assertIn("laneBaseX[v.id] = baseX;", body)
 
 
+class RiverShaderTests(unittest.TestCase):
+    """The real-browser failure this class exists for: the halo material
+    injected `dot(vColor.rgb, ...)` into the fragment shader, but three r137
+    only DECLARES `varying vec3 vColor` under USE_COLOR / USE_COLOR_ALPHA.  The
+    halo had neither vertexColors nor a shared instanceColor, so vColor was an
+    undeclared identifier: GLSL compile error, the whole program is invalid,
+    `useProgram: program not valid` on every frame, and a BLACK canvas while
+    nodes / drawCalls / triangles / painted all still looked healthy."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.node = shutil.which("node")
+        cls.river = RiverModeTests._read("static", "js", "river.js")
+        cls.app = RiverModeTests._read("static", "js", "app.js")
+        cls.html = RiverModeTests._read("static", "index.html")
+
+    def test_the_halo_injection_is_guarded_by_use_color(self):
+        river = self.river
+        marker = river.find("function haloMaterial(")
+        self.assertGreater(marker, 0)
+        body = river[marker:marker + 1600]
+        # the reference to vColor must sit inside a USE_COLOR guard
+        self.assertIn("vColor.rgb", body)
+        self.assertIn("#if defined( USE_COLOR_ALPHA ) || defined( USE_COLOR )", body)
+        # ... and the guard has to close again
+        self.assertIn("#endif", body)
+
+    def test_the_halo_shares_the_core_colour_buffer(self):
+        # sharing instanceColor is what makes three define USE_INSTANCING_COLOR
+        # (hence declare vColor) for the halo as well, and it also tints the
+        # glow with the node's own hue.
+        self.assertIn("halos.instanceColor = cores.instanceColor;", self.river)
+
+    def test_shader_errors_are_surfaced_not_hidden(self):
+        river = self.river
+        # three's own program checking is switched on explicitly
+        self.assertIn("renderer.debug.checkShaderErrors = true", river)
+        # and the live programs are inspected, with the driver log kept
+        self.assertIn("function inspectPrograms()", river)
+        self.assertIn("renderer.info", river)
+        self.assertIn("diagnostics", river)
+        self.assertIn("programLog", river)
+        self.assertIn("shaderErrors:", river)
+        self.assertIn("shaderLog:", river)
+        # it reaches the journal through the same warn hook the panel shows
+        self.assertIn("русло: шейдер не собрался", river)
+
+    def test_self_check_refuses_to_call_a_broken_frame_fine(self):
+        river = self.river
+        marker = river.find("function selfCheck(")
+        body = river[marker:marker + 6000]
+        # an invalid program or an empty frame must NOT report supported: true
+        self.assertIn("out.supported = false;", body)
+        self.assertIn("out.reason =", body)
+        self.assertIn("шейдер не собрался", body)
+        self.assertIn("кадр пуст", body)
+        # and the verdict reaches the panel/diagnostics
+        self.assertIn("checkReason:", river)
+        self.assertIn("checkSupported", self.app)
+
+    def test_the_panel_shows_the_shader_state(self):
+        # a broken program gets its own diagnostic row
+        self.assertIn('id="river-shader"', self.html)
+        self.assertIn("river-shader", self.app)
+
+    # ---- live: the real river.js under the real three r137 ------------------ #
+
+    def test_no_program_fails_to_link_under_three_r137(self):
+        """Runs the real river.js against the real vendored three with a mock GL
+        that reproduces a driver's #define-aware compile check, and requires
+        that EVERY program three builds links cleanly."""
+        out = self._run_shader_stand()
+        self.assertGreater(out["programs"], 0, "no programs were built at all")
+        self.assertEqual(out["broken"], 0,
+                         "a program failed to link: %r" % (out["brokenDetail"],))
+        self.assertEqual(out["linked"], out["programs"])
+        self.assertEqual(out["shaderErrors"], 0)
+        self.assertTrue(out["shaderChecked"], "the program inspection must run")
+        self.assertTrue(out["painted"])
+        self.assertGreater(out["triangles"], 0)
+
+    def test_the_halo_program_links_and_declares_vcolor(self):
+        out = self._run_shader_stand()
+        halo = out.get("halo") or {}
+        self.assertTrue(halo.get("vertexPresent"), "the halo vertex pass (uGrow) must exist")
+        self.assertTrue(halo.get("fragmentPresent"), "the halo fragment pass must exist")
+        # the fragment pass reads dot(vColor.rgb, ...), so vColor has to be a real
+        # declaration - that is what the shared instanceColor now guarantees
+        self.assertTrue(halo.get("fragmentDeclaresVColor"),
+                        "the halo fragment shader must declare vColor")
+
+    def test_the_stand_rejects_the_old_unguarded_halo_shader(self):
+        """The checker must have teeth.  Fed the PRE-FIX shape - the halo
+        injection reading vColor with no USE_COLOR guard, and no shared
+        instanceColor to make three declare it - it has to report a broken
+        program.  The mutations below are done on the literal source text, so
+        they are independent of how the JS escapes its newlines."""
+        bs_n = chr(92) + "n"                                  # the literal two chars in the JS source
+        guard = "#if defined( USE_COLOR_ALPHA ) || defined( USE_COLOR )"
+        self.assertIn(guard, self.river)
+        broken = self.river.replace(guard + bs_n, "")          # drop the opening #if
+        broken = broken.replace(bs_n + "#endif", "")           # ... and its matching #endif
+        broken = broken.replace("halos.instanceColor = cores.instanceColor;", "")
+        self.assertNotEqual(broken, self.river, "the mutation did not apply")
+        self.assertNotIn(guard, broken)
+        out = self._run_shader_stand(river_source=broken, expect_failure=True)
+        self.assertGreater(out["broken"], 0, "the checker did not catch the old bug")
+        self.assertIn("vColor", json.dumps(out["brokenDetail"]))
+
+    def _run_shader_stand(self, river_source=None, expect_failure=False):
+        if not self.node:
+            self.skipTest("node is not available")
+        script = os.path.join(PROJECT_ROOT, ".tmp", "river_shaders_stand.js")
+        os.makedirs(os.path.dirname(script), exist_ok=True)
+        with io.open(script, "w", encoding="utf-8") as handle:
+            handle.write(self._shader_stand_source())
+        env = dict(os.environ)
+        if river_source is not None:
+            variant = os.path.join(PROJECT_ROOT, ".tmp", "river_shader_variant.js")
+            with io.open(variant, "w", encoding="utf-8", newline="") as handle:
+                handle.write(river_source)
+            env["RIVER_JS"] = variant
+        env["OUTJSON"] = os.path.join(PROJECT_ROOT, ".tmp", "river_shader_report.json")
+        proc = subprocess.run([self.node, script], cwd=PROJECT_ROOT, stdout=subprocess.PIPE,
+                              stderr=subprocess.STDOUT, timeout=180, env=env)
+        text = proc.stdout.decode("utf-8", "replace")
+        start = text.find("{")
+        self.assertGreaterEqual(start, 0, text)
+        # the stand exits 1 exactly when a program failed to link; that is the
+        # expected outcome only for the mutation test
+        if not expect_failure:
+            self.assertEqual(proc.returncode, 0, text)
+        return json.loads(text[start:])
+
+    def _shader_stand_source(self):
+        path = os.path.join(PROJECT_ROOT, "tests", "fixtures_river_shaders.js")
+        with io.open(path, encoding="utf-8") as handle:
+            return handle.read()
+
+
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

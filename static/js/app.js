@@ -2553,10 +2553,17 @@
       ];
       if (st.checkError) bits.push("ошибка: " + st.checkError);
       if (st.linkWinding === false) bits.push("квад не рисуется!");
+      // An unsupported/failed check is not a pass: say WHY, not just the zeroes.
+      if (!st.checkSupported && st.checkReason) bits.push("НЕ ПРОШЛА: " + st.checkReason);
       setText("river-check", bits.join(" · "));
     } else {
       setText("river-check", "нажмите «Самопроверка»");
     }
+    // The shader state is its own row: a program that did not compile is the
+    // failure this whole panel has to make impossible to hide.
+    setText("river-shader", st.shaderErrors
+      ? ("ОШИБКА: " + st.shaderErrors + " программа(ы)")
+      : (st.shaderChecked ? "в порядке" : "—"));
     setText("river-dangling", String(st.danglingLinks || 0));
     setText("river-warn", st.warnings
       ? (st.warnings + (st.lastWarning ? (" \u00b7 " + st.lastWarning) : ""))
