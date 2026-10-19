@@ -30,3 +30,4 @@ Desktop.ini
 # logs and temporary render output
 *.log
 docs/diagrams/*.render.html
+docs/screenshots/_*

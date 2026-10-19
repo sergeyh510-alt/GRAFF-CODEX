@@ -1032,7 +1032,7 @@ class RiverModeTests(unittest.TestCase):
     def test_river_layout_is_computed_and_append_only(self):
         river = self._river()
         # a slot maps to a fixed point of the snaked stream: no forces involved
-        self.assertIn("function coordsFor(slot)", river)
+        self.assertIn("function coordsFor(slot, depthAbs)", river)
         self.assertIn("BAND_CAP", river)
         self.assertIn("function packRuns(", river)
         self.assertIn("function routineUnits(", river)
@@ -1045,7 +1045,11 @@ class RiverModeTests(unittest.TestCase):
     def test_river_uses_instancing_lines_and_a_spark_pool(self):
         river = self._river()
         self.assertIn("new THREE_.InstancedMesh(", river)   # nodes: one draw call
-        self.assertIn("new THREE_.LineSegments(", river)    # links: one draw call
+        # links are one camera-facing ribbon mesh, so the WHOLE scene is exactly
+        # two instanced passes plus the ribbon plus the spark pool: four calls,
+        # and none of them per node or per edge.
+        self.assertNotIn("LineSegments", river)
+        self.assertIn("new THREE_.Mesh(linkGeo, linkMat)", river)  # links: one draw call
         self.assertIn("SPARK_POOL", river)                  # sparks: bounded
         self.assertIn("AdditiveBlending", river)
         # never a per-node DOM element or a per-node scene object
@@ -1249,12 +1253,20 @@ class RiverPaintTests(unittest.TestCase):
         self.assertEqual(proc.returncode, 0, proc.stdout.decode("utf-8", "replace"))
         return json.loads(proc.stdout.decode("utf-8", "replace"))
 
+    @staticmethod
+    def _scene_harness_source(payload, river):
+        return RiverPaintTests._harness_text(payload, river)
+
     def _scene_harness(self, payload):
         """Runs the real river.js against a three stub that behaves like three
         where it matters: an InstancedMesh starts with an all-zero matrix, and a
         zero matrix draws nothing at all, so an instance nobody wrote is
         invisible.  Time and requestAnimationFrame are controlled by the test,
         so the render loop is driven deterministically."""
+        return self._harness_text(payload, self.river)
+
+    @staticmethod
+    def _harness_text(payload, river):
         return (
             "global.window = global;\n"
             "const fs = require('fs'), vm = require('vm');\n"
@@ -1265,7 +1277,8 @@ class RiverPaintTests(unittest.TestCase):
             "  copy(v) { this.x = v.x; this.y = v.y; this.z = v.z; return this; }\n"
             "  project() { this.x = 0.1; this.y = 0.1; this.z = 0.9; return this; } }\n"
             "class Col { constructor(c) { this.r = 0.5; this.g = 0.5; this.b = 0.5; if (c !== undefined) this.set(c); }\n"
-            "  set() { return this; } lerp() { return this; } }\n"
+            "  set() { return this; } setRGB(r, g, b) { this.r = r; this.g = g; this.b = b; return this; }\n"
+            "  lerp() { return this; } }\n"
             "class Obj3 { constructor() { this.children = []; this.position = new Vec3(); this.scale = new Vec3(1, 1, 1);\n"
             "  this.visible = true; this.frustumCulled = true; } add(o) { this.children.push(o); return o; }\n"
             "  remove(o) { return o; } lookAt() {} }\n"
@@ -1275,6 +1288,7 @@ class RiverPaintTests(unittest.TestCase):
             "class Attr { constructor(a, s) { this.array = a; this.itemSize = s; this.needsUpdate = false; } }\n"
             "class Mat { constructor(o) { Object.assign(this, o || {}); } dispose() {} }\n"
             "class Pts extends Obj3 { constructor(g, m) { super(); this.geometry = g; this.material = m; } }\n"
+            "class Mesh extends Obj3 { constructor(g, m) { super(); this.geometry = g; this.material = m; } }\n"
             "class Lines extends Obj3 { constructor(g, m) { super(); this.geometry = g; this.material = m; } }\n"
             "class Inst extends Obj3 { constructor(g, m, n) { super(); this.geometry = g; this.material = m; this.count = 0;\n"
             "  this.cap = n; this.instanceMatrix = { array: new Float64Array(n * 16), setUsage() {}, needsUpdate: false };\n"
@@ -1285,6 +1299,8 @@ class RiverPaintTests(unittest.TestCase):
             "    this.instanceColor.array[i * 3 + 1] = c.g; this.instanceColor.array[i * 3 + 2] = c.b; }\n"
             "  liveInstances() { let n = 0; for (let i = 0; i < this.count; i++)\n"
             "    if (scaleOf(this.instanceMatrix.array.slice(i * 16, i * 16 + 16)) > 1e-6) n++; return n; } }\n"
+            "class V2 { constructor(x, y) { this.x = x || 0; this.y = y || 0; }\n"
+            "  set(x, y) { this.x = x; this.y = y; return this; } }\n"
             "class M4 { constructor() { this.elements = new Float64Array(16); }\n"
             "  compose(p, q, s) { const e = this.elements; e[0] = s.x; e[5] = s.y; e[10] = s.z; e[15] = 1;\n"
             "    e[12] = p.x; e[13] = p.y; e[14] = p.z; return this; } }\n"
@@ -1294,7 +1310,9 @@ class RiverPaintTests(unittest.TestCase):
             "  render(sc) { this.info.render.calls = 0; this.info.render.triangles = 0;\n"
             "    const walk = (o) => { if (!o.visible) return;\n"
             "      if (o instanceof Inst) { const live = o.liveInstances();\n"
-            "        if (live > 0) { this.info.render.calls++; this.info.render.triangles += live * 12; } }\n"
+            "        if (live > 0) { this.info.render.calls++; this.info.render.triangles += live * 36; } }\n"
+            "      else if (o instanceof Mesh) { const c = o.geometry.drawRange.count;\n"
+            "        if (c > 0) { this.info.render.calls++; this.info.render.triangles += c / 3; } }\n"
             "      else if (o instanceof Lines) { const c = o.geometry.drawRange.count;\n"
             "        if (c > 0) { this.info.render.calls++; this.info.render.triangles += c / 2; } }\n"
             "      else if (o instanceof Pts) { const pos = o.geometry.attributes.position;\n"
@@ -1303,8 +1321,9 @@ class RiverPaintTests(unittest.TestCase):
             "const THREE = { Scene: function () { scene = new Obj3(); scene.background = null; return scene; },\n"
             "  PerspectiveCamera: class extends Obj3 { updateProjectionMatrix() {} }, WebGLRenderer: Renderer,\n"
             "  Vector3: Vec3, Color: Col, Quaternion: class { set() { return this; } }, Matrix4: M4,\n"
-            "  Points: Pts, LineSegments: Lines, InstancedMesh: Inst, BufferGeometry: Geo, BufferAttribute: Attr,\n"
+            "  Points: Pts, LineSegments: Lines, Mesh: Mesh, InstancedMesh: Inst, BufferGeometry: Geo, BufferAttribute: Attr,\n"
             "  SphereGeometry: class extends Geo {}, MeshBasicMaterial: Mat, LineBasicMaterial: Mat, PointsMaterial: Mat,\n"
+            "  ShaderMaterial: Mat, Vector2: V2, DoubleSide: 2, AdditiveBlending: 2,\n"
             "  CanvasTexture: class {}, AdditiveBlending: 2, DynamicDrawUsage: 35048, REVISION: '137-mock', Timer: null };\n"
             "global.THREE = THREE;\n"
             "// deterministic clock + frame queue: the test drives every frame itself\n"
@@ -1340,7 +1359,7 @@ class RiverPaintTests(unittest.TestCase):
             "function feed(river, items) { const m = R.layout(items, true);\n"
             "  const ls = m.nodes.slice(1).map((n, i) => ({ from: m.nodes[i].id, to: n.id }));\n"
             "  river.setData(m.nodes, ls, {}); return m; }\n"
-            % self.river
+            % river
         ) + payload
 
     def test_empty_boot_then_data_paints(self):
@@ -1421,7 +1440,7 @@ class RiverPaintTests(unittest.TestCase):
         self.assertTrue(out["settledPainted"], "the settled canvas must still hold a frame")
         self.assertGreater(out["tri"], 0)
         self.assertTrue(out["painted"])
-        self.assertTrue(out["running"], "an idle river stays live")
+        self.assertTrue(out["running"], "an idle river stays live (parked, not dead)")
         self.assertTrue(out["idle"], "nothing is animating, so the loop must go idle")
         self.assertGreater(out["idleMs"], 0, "an idle scene must be throttled, not looped at 60 Hz")
         self.assertLess(out["idleFrames"], out["idlePumps"],
@@ -1444,6 +1463,518 @@ class RiverPaintTests(unittest.TestCase):
         # a parked loop may not leave a stale canvas behind
         self.assertIn("if (drawFinal !== false && pendingFrame && !document.hidden) renderOnce(nowMs());", river)
         self.assertIn("stop(false);", river)   # dispose() must not paint
+
+
+class RiverBrightnessTests(unittest.TestCase):
+    """«Русло» must read on a dark background: a second additive halo pass and
+    a ribbon per edge, both still one draw call each."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.river = RiverModeTests._read("static", "js", "river.js")
+        cls.app = RiverModeTests._read("static", "js", "app.js")
+        cls.html = RiverModeTests._read("static", "index.html")
+
+    def test_halo_is_a_second_instanced_pass(self):
+        river = self.river
+        # the halo shares the core matrix buffer and adds exactly one draw call
+        self.assertIn("var halos = new THREE_.InstancedMesh(coreGeo, haloMat, MAX_NODES);", river)
+        self.assertIn("halos.instanceMatrix = cores.instanceMatrix;", river)
+        self.assertIn("halos.count = sceneNodes;", river)
+        # it is additive and cheap - never a sprite per node
+        self.assertIn("function haloMaterial(", river)
+        self.assertIn("HALO_GROW", river)
+        self.assertIn("HALO_OPACITY", river)
+        self.assertNotIn("nodeThreeObject", river)
+
+    def test_links_are_camera_facing_ribbons_in_one_geometry(self):
+        river = self.river
+        self.assertIn("LINK_VERTS", river)
+        self.assertIn("attribute vec3 other;", river)
+        self.assertIn("attribute vec2 corner;", river)
+        self.assertIn("new THREE_.Mesh(linkGeo, linkMat)", river)
+        # thickness is a uniform in pixels, never the ignored linewidth
+        self.assertIn("uPx", river)
+        # thickness is never delegated to the WebGL linewidth, which is ignored
+        self.assertNotIn("linewidth:", river)
+        # the ribbon shader declares its own colour attribute: a ShaderMaterial
+        # does not get three's "attribute vec3 color" for free, and without it
+        # the program fails to link and NO edge is drawn at all
+        self.assertIn("attribute vec3 color;", river)
+        marker = river.find("function linkMaterial(")
+        self.assertIn("attribute vec3 color;", river[marker:marker + 1200])
+        # the UI exposes the thickness and it is persisted
+        self.assertIn('id="river-link-px"', self.html)
+        self.assertIn("riverLinkPx", self.app)
+        self.assertIn("linkWidth: linkWidth,", river)
+
+    def test_brightness_is_a_table_not_a_per_frame_string(self):
+        river = self.river
+        # a saturated core: the palette is brightened by type, errors loudest
+        self.assertIn("TYPE_GAIN", river)
+        self.assertIn("COLOUR_BUCKETS", river)
+        self.assertIn("buildColourTable", river)
+        # old nodes cool into the deep violet, red stays with the errors
+        self.assertIn("COLD_MIN", river)
+        self.assertIn("cold:", river)
+        self.assertIn('if (key === "error")', river)
+
+    def test_no_allocation_inside_the_frame_loop(self):
+        river = self.river
+        for fn in ("writeNode", "flushDirty", "recolour", "updateSparks", "pruneActive", "loop", "renderOnce"):
+            i = river.find("function " + fn + "(")
+            self.assertGreater(i, 0, fn + " is missing")
+            body = river[i:i + 3200]
+            self.assertNotIn("new THREE_.Color(", body, fn + " must not allocate a Color")
+            self.assertNotIn("new THREE_.Vector3(", body, fn + " must not allocate a Vector3")
+            self.assertNotIn(".splice(", body, fn + " must not splice (allocation churn)")
+            self.assertNotIn("coolColor(", body, fn + " must not rebuild a colour string")
+
+
+class RiverPerfTests(unittest.TestCase):
+    """The measured cost of the mode: nothing is re-uploaded unless it changed,
+    an idle scene parks itself, and an upload is a partial range."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.node = shutil.which("node")
+        cls.river = RiverModeTests._read("static", "js", "river.js")
+
+    def _river(self):
+        return self.river
+
+    def _run(self, name, body):
+        if not self.node:
+            self.skipTest("node is not available")
+        script = os.path.join(PROJECT_ROOT, ".tmp", name)
+        os.makedirs(os.path.dirname(script), exist_ok=True)
+        with io.open(script, "w", encoding="utf-8") as handle:
+            handle.write(body)
+        proc = subprocess.run([self.node, script], cwd=PROJECT_ROOT, stdout=subprocess.PIPE,
+                              stderr=subprocess.STDOUT, timeout=120)
+        self.assertEqual(proc.returncode, 0, proc.stdout.decode("utf-8", "replace"))
+        return json.loads(proc.stdout.decode("utf-8", "replace"))
+
+    def test_dirty_flags_gate_every_upload(self):
+        river = self.river
+        # one flag per buffer and a flush that respects them
+        for flag in ("DIRTY_MATRIX", "DIRTY_COLOR", "DIRTY_LINK", "DIRTY_LINKCOLOR", "DIRTY_SPARK"):
+            self.assertIn(flag, river)
+        self.assertIn("function flushDirty()", river)
+        self.assertIn("var d = renderDirty;", river)
+        self.assertIn("if (!d) return;", river)
+        # dead weight: the old code set every needsUpdate on every frame
+        self.assertNotIn("cores.instanceMatrix.needsUpdate = true;\n      if (cores.instanceColor)", river)
+        # a partial upload through three's updateRange
+        self.assertIn("updateRange = ranged", river)
+
+    def test_stats_carries_the_measurable_counters(self):
+        river = self.river
+        for key in ("uploadsPerSecond:", "frameMsMax:", "frameMsAvg:", "idleGap:",
+                    "uploadMatrix:", "uploadColour:", "uploadSparks:", "uploadLinks:",
+                    "uploadLinkGeometry:", "coolSettled:", "triangles:", "drawCalls:"):
+            self.assertIn(key, river, "stats() must report " + key)
+        self.assertIn("perfCounters", river)
+
+    def test_geometry_is_light_and_the_scene_parks(self):
+        out = self._run("river_perf_node.js", self._node_harness(self._perf_probe()))
+        # triangles per node drop several-fold at the same look
+        self.assertLess(out["trianglesPerNode"], 90, "the core sphere must be light")
+        self.assertGreater(out["trianglesPerNode"], 10)
+        self.assertIn("x", out["coreSegments"])
+        # exactly: the node pass twice (cores + halos) plus the ribbon (plus the
+        # spark pool when it holds live particles)
+        self.assertLessEqual(out["drawCalls"], 5)
+        self.assertGreaterEqual(out["drawCalls"], 3)
+        self.assertEqual(out["haloCount"], out["nodes"], "every node gets a halo")
+        self.assertGreater(out["haloGrow"], 1.2)
+        # an idle scene parks for real: neither frames nor uploads
+        self.assertEqual(out["idleFrames"], 0, "a parked loop must draw nothing")
+        self.assertEqual(out["idleUploads"], 0, "an idle scene must upload nothing")
+        # the mode stays live, but it stops ASKING for animation frames: no
+        # frames, no uploads, nothing burning the CPU while the scene is settled
+        self.assertTrue(out["idleRunning"], "a parked river is still a live mode")
+        self.assertFalse(out["idleScheduled"], "after the grace window the loop stops asking for frames")
+        self.assertGreater(out["idleGap"], 0)
+        self.assertTrue(out["coolSettled"], "the palette must reach a fixed point")
+        # Animated frames legitimately re-upload, but only the animated span:
+        # the elements pushed stay far below "every frame rewrites every node".
+        self.assertLess(out["burstMatrixElems"], out["burstFrames"] * out["nodes"] * 0.5,
+                        "an animated frame must upload a partial range, not the whole scene")
+        self.assertLess(out["uploadsPerSecond"], 200)
+        self.assertTrue(out["painted"])
+
+    def _node_harness(self, payload):
+        # Reuse the proven scene harness: the real river.js plus a three stub
+        # that behaves like three where it matters (an instance nobody wrote is
+        # invisible).  The probe below drives it and reports the counters.
+        # The scene harness is a plain function of the river source; reuse it
+        # without instantiating the test case.
+        # _harness_text reads the river through fs.readFileSync, so it needs the
+        # path, not the source text.
+        river_path = os.path.join(PROJECT_ROOT, "static", "js", "river.js")
+        return RiverPaintTests._scene_harness_source(payload, river_path)
+
+    def _perf_probe(self):
+        """Measures the effect of the perf work from INSIDE the scene harness:
+        the counter surface is the module's own stats()/perfCounters()."""
+        return (
+            "const river = R.create(HOST, {});\n"
+            "const m = feed(river, chain(900));\n"
+            "drain(80, 16);                     // the arrival burst settles\n"
+            "const a = river.stats(), pa = river.perfCounters();\n"
+            "drain(600, 16);                    // wind down: active nodes age out\n"
+            "const b = river.stats(), pb = river.perfCounters();\n"
+            "drain(400, 16);                    // parked: nothing left to animate\n"
+            "const c = river.stats(), pc = river.perfCounters();\n"
+            "console.log(JSON.stringify({\n"
+            "  nodes: c.nodes, links: c.links, drawCalls: c.drawCalls, triangles: c.triangles,\n"
+            "  trianglesPerNode: Math.round(c.triangles / c.nodes),\n"
+            "  painted: c.painted, written: river.writtenInstances(),\n"
+            "  burstFrames: a.frames, burstMatrixUploads: pa.uploadMatrix,\n"
+            "  burstMatrixElems: pa.uploadMatrixElems,\n"
+            "  idleFrames: c.frames - b.frames, idleUploads: (pc.uploadMatrix - pb.uploadMatrix) + (pc.uploadColour - pb.uploadColour) + (pc.uploadSparks - pb.uploadSparks),\n"
+            "  idleRunning: c.running, idleScheduled: c.scheduled, idleGap: c.idleGap, coolSettled: c.coolSettled,\n"
+            "  uploadsPerSecond: c.uploadsPerSecond, frameMsMax: c.frameMsMax,\n"
+            "  haloCount: c.haloCount, haloGrow: c.haloGrow, haloOpacity: c.haloOpacity,\n"
+            "  coreSegments: c.coreSegments, linkPx: c.linkPx, sparkPointsWritten: c.sparkPointsWritten\n"
+            "}));"
+        )
+
+
+
+class RiverRobustnessTests(unittest.TestCase):
+    """The crash that blanked the canvas must be impossible: a record the scene
+    cannot resolve is COUNTED and skipped, never dereferenced, and a broken row
+    is reported to the journal instead of throwing."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.node = shutil.which("node")
+        cls.river_src = RiverModeTests._read("static", "js", "river.js")
+        cls.app = RiverModeTests._read("static", "js", "app.js")
+        cls.html = RiverModeTests._read("static", "index.html")
+
+    def _run(self, name, body):
+        if not self.node:
+            self.skipTest("node is not available")
+        river_path = os.path.join(PROJECT_ROOT, "static", "js", "river.js")
+        script = os.path.join(PROJECT_ROOT, ".tmp", name)
+        os.makedirs(os.path.dirname(script), exist_ok=True)
+        with io.open(script, "w", encoding="utf-8") as handle:
+            handle.write(RiverPaintTests._harness_text(body, river_path))
+        proc = subprocess.run([self.node, script], cwd=PROJECT_ROOT, stdout=subprocess.PIPE,
+                              stderr=subprocess.STDOUT, timeout=120)
+        self.assertEqual(proc.returncode, 0, proc.stdout.decode("utf-8", "replace"))
+        return json.loads(proc.stdout.decode("utf-8", "replace"))
+
+    # ---- static: the fix is the one that was identified ----------------------
+
+    def test_row_of_never_dereferences_an_unknown_node(self):
+        src = self.river_src
+        marker = src.find("function rowOf(n) {")
+        self.assertGreater(marker, 0)
+        body = src[marker:marker + 700]
+        # the guard is the FIRST thing rowOf does: the old first line was the
+        # crash itself ("Cannot read properties of undefined (reading
+        # 'endOfStream')"), so it may not lead the function any more.
+        self.assertIn('if (!n || typeof n !== "object")', body)
+        self.assertNotRegex(body, r"^\s*if \(n\.endOfStream\) return rowEnd;")
+
+    def test_unknown_type_falls_back_to_tool_call_not_message(self):
+        src = self.river_src
+        self.assertIn('typeSlot[n.actor === "user" ? "user" : "tool_call"]', src)
+        self.assertNotIn('typeSlot[n.actor === "user" ? "user" : "message"]', src)
+
+    def test_group_nodes_get_a_colourful_twin_row_never_grey(self):
+        src = self.river_src
+        self.assertIn("mutedBase", src)
+        self.assertIn("if (n.count > 1 && mutedBase >= 0) return mutedBase + row;", src)
+        # the twin rows are built from the type rows, pulled towards the cold hue
+        self.assertIn("mutedBase = colourTable.length;", src)
+
+    def test_cooling_is_measured_against_the_session_not_the_wall_clock(self):
+        src = self.river_src
+        self.assertIn("function sessionFrac(ts)", src)
+        self.assertIn("function ageFracOf(ts)", src)
+        self.assertEqual(src.count("fracAt("), 0, "the dead wall-clock helper must be gone")
+        # sessionFrac reads only the oldest/newest timestamps of the session
+        i = src.find("function sessionFrac(ts)")
+        self.assertIn("newestTs - oldestTs", src[i:i + 400])
+
+    def test_dangling_links_are_counted_not_thrown(self):
+        src = self.river_src
+        self.assertIn("dangling", src)
+        self.assertIn("if (!a || !b) { dangling++; continue; }", src)
+        self.assertIn("danglingLinks: dangling,", src)
+
+    def test_the_pixel_self_check_is_exposed_to_the_app(self):
+        src = self.river_src
+        self.assertIn("function selfCheck()", src)
+        self.assertIn("renderer.readRenderTargetPixels(", src)
+        for key in ("nonBlack", "hues", "linePixels", "nodesInFrame"):
+            self.assertIn(key, src, "selfCheck must report " + key)
+        self.assertIn("selfCheck: selfCheck,", src)
+        # it reaches the diagnostics panel and the test hook in app.js
+        self.assertIn("river.selfCheck()", self.app)
+        self.assertIn('id="river-check"', self.html)
+
+    def test_a_broken_record_is_reported_to_the_app_journal(self):
+        # the scene takes a warn hook, and app.js routes it to the same glLog the
+        # error block shows
+        self.assertIn("onWarn", self.river_src)
+        self.assertIn("function warn(msg)", self.river_src)
+        self.assertIn("onWarn: function (msg) { pushLog(", self.app)
+        self.assertIn('id="river-warn"', self.html)
+
+    # ---- harness: a broken record must still leave a painted canvas ----------
+
+    def test_dangling_edge_is_skipped_and_counted(self):
+        out = self._run("river_robust_dangling.js",
+            "const river = R.create(HOST, {});\n"
+            "const m = R.layout(chain(60), true);\n"
+            "const ls = m.nodes.slice(1).map((n, i) => ({ from: m.nodes[i].id, to: n.id }));\n"
+            "// a rotten edge with an endpoint that is not in the scene\n"
+            "ls.push({ from: 'r:ghost', to: m.nodes[0].id });\n"
+            "ls.push({ from: m.nodes[0].id, to: 'r:ghost' });\n"
+            "river.setData(m.nodes, ls, {});\n"
+            "river.renderOnce();\n"
+            "const st = river.stats();\n"
+            "console.log(JSON.stringify({ dangling: st.danglingLinks, nodes: st.nodes,\n"
+            "  painted: st.painted, triangles: st.triangles, links: st.links }));")
+        self.assertGreaterEqual(out["dangling"], 2, "both rotten edges must be counted")
+        self.assertGreater(out["nodes"], 0)
+        self.assertTrue(out["painted"], "a dangling edge must not blank the canvas")
+        self.assertGreater(out["triangles"], 0)
+
+    def test_undefined_chain_endpoint_does_not_throw(self):
+        # the exact shape of the browser crash: a link whose 'to' is not a string
+        out = self._run("river_robust_undefined.js",
+            "const river = R.create(HOST, {});\n"
+            "const m = R.layout(chain(40), true);\n"
+            "const ls = [{ from: m.nodes[0].id, to: undefined },\n"
+            "  { from: null, to: m.nodes[1].id }, { from: m.nodes[0].id, to: m.nodes[1].id }];\n"
+            "river.setData(m.nodes, ls, {});\n"
+            "river.renderOnce();\n"
+            "const st = river.stats();\n"
+            "console.log(JSON.stringify({ dangling: st.danglingLinks, nodes: st.nodes,\n"
+            "  painted: st.painted, warned: st.warnings, last: st.lastWarning }));")
+        self.assertGreaterEqual(out["dangling"], 2)
+        self.assertTrue(out["painted"], "a non-string endpoint must not throw")
+        self.assertGreaterEqual(out["warned"], 1, "the skip must be reported")
+
+    def test_empty_and_null_data_do_not_throw(self):
+        out = self._run("river_robust_empty.js",
+            "const river = R.create(HOST, {});\n"
+            "river.setData(null, null, {});\n"
+            "river.setData([], [], {});\n"
+            "river.renderOnce();\n"
+            "const st = river.stats();\n"
+            "console.log(JSON.stringify({ nodes: st.nodes, links: st.links }));")
+        self.assertEqual(out["nodes"], 0)
+        self.assertEqual(out["links"], 0)
+
+    def test_self_check_is_supported_under_the_stub(self):
+        # the stub renderer has no render targets: selfCheck must say so instead
+        # of throwing, so the app can show a dash
+        out = self._run("river_robust_selfcheck.js",
+            "const river = R.create(HOST, {});\n"
+            "feed(river, chain(50));\n"
+            "const r = river.selfCheck();\n"
+            "console.log(JSON.stringify({ obj: typeof r, supported: r.supported,\n"
+            "  nonBlack: r.nonBlack, hues: r.hues, lines: r.linePixels }));")
+        self.assertEqual(out["obj"], "object")
+        self.assertIn("supported", out)
+
+
+    def test_a_prototype_keyed_endpoint_is_skipped_not_dereferenced(self):
+        # The one way an endpoint can slip past "=== undefined": the id -> index
+        # map is a plain {}, so an id like "constructor" reads the INHERITED
+        # Object.prototype.constructor -- a function, not undefined -- and the
+        # old `nodeList[fromIdx]` then indexed by a non-number.  That is what put
+        # an undefined into rowOf and threw
+        # "Cannot read properties of undefined (reading endOfStream)".
+        out = self._run("river_robust_prototype.js",
+            "const river = R.create(HOST, {});\n"
+            "const m = R.layout(chain(40), false);\n"
+            "const ls = m.nodes.slice(1).map((n, i) => ({ from: m.nodes[i].id, to: n.id }));\n"
+            "ls.push({ from: m.nodes[0].id, to: 'constructor' });\n"
+            "ls.push({ from: 'toString', to: m.nodes[1].id });\n"
+            "river.setData(m.nodes, ls, {});\n"
+            "river.renderOnce();\n"
+            "const st = river.stats();\n"
+            "console.log(JSON.stringify({ dangling: st.danglingLinks, nodes: st.nodes,\n"
+            "  links: st.links, painted: st.painted, warned: st.warnings }));")
+        self.assertGreaterEqual(out["dangling"], 2, "both prototype-keyed edges must be counted")
+        self.assertGreater(out["nodes"], 0)
+        self.assertGreater(out["links"], 0)
+        self.assertTrue(out["painted"], "a prototype-keyed endpoint must not blank the canvas")
+
+    def test_the_link_guard_rejects_a_non_numeric_index(self):
+        # the guard is on the MAPPED index, not on the string id: a value that
+        # came back from the map must still be a number inside the scene
+        src = self.river_src
+        i = src.find("var fromIdx =")
+        guard = src[i:i + 900]
+        self.assertIn('typeof lk0.from === "string"', guard)
+        self.assertIn("indexOfId[lk0.from]", guard)
+        self.assertIn("if (!a || !b) { dangling++; continue; }", src)
+
+
+class RiverIdentityMapTests(unittest.TestCase):
+    """The crash was a PROTOTYPE KEY, not a missing node: indexOfId was a plain
+    {}, so an id like "constructor" read back Object.prototype.constructor (a
+    function), sailed past the `=== undefined` guard, and nodeList[fn] handed an
+    undefined to rowOf().  Every id-keyed map is now null-prototype."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.node = shutil.which("node")
+        cls.river_src = RiverModeTests._read("static", "js", "river.js")
+        cls.app = RiverModeTests._read("static", "js", "app.js")
+
+    def _run(self, name, body):
+        if not self.node:
+            self.skipTest("node is not available")
+        river_path = os.path.join(PROJECT_ROOT, "static", "js", "river.js")
+        script = os.path.join(PROJECT_ROOT, ".tmp", name)
+        os.makedirs(os.path.dirname(script), exist_ok=True)
+        with io.open(script, "w", encoding="utf-8") as handle:
+            handle.write(RiverPaintTests._harness_text(body, river_path))
+        proc = subprocess.run([self.node, script], cwd=PROJECT_ROOT, stdout=subprocess.PIPE,
+                              stderr=subprocess.STDOUT, timeout=120)
+        self.assertEqual(proc.returncode, 0, proc.stdout.decode("utf-8", "replace"))
+        return json.loads(proc.stdout.decode("utf-8", "replace"))
+
+    def test_every_id_map_is_null_prototype(self):
+        for src in (self.river_src, self.app):
+            self.assertIn("Object.create(null)", src)
+        self.assertIn("function newIdMap() { return Object.create(null); }", self.river_src)
+        self.assertIn("var indexOfId = newIdMap();", self.river_src)
+        self.assertIn("var seenLink = newIdMap();", self.river_src)
+        self.assertIn("var byRaw = newIdMap();", self.river_src)
+        self.assertIn("function idMap() { return Object.create(null); }", self.app)
+        self.assertIn("var rawNodes = idMap();", self.app)
+        self.assertIn("var edgeIds = idMap();", self.app)
+
+    def test_a_prototype_keyed_id_is_not_a_node(self):
+        # "constructor" must read back as ABSENT: the edge is dropped and counted
+        # instead of resolving to Object.prototype.constructor
+        out = self._run("river_proto_map.js",
+            "const river = R.create(HOST, {});\n"
+            "const m = R.layout(chain(30), false);\n"
+            "const ls = [{ from: m.nodes[0].id, to: 'constructor' },\n"
+            "  { from: 'valueOf', to: m.nodes[1].id },\n"
+            "  { from: m.nodes[0].id, to: m.nodes[1].id }];\n"
+            "river.setData(m.nodes, ls, {});\n"
+            "river.renderOnce();\n"
+            "const st = river.stats();\n"
+            "console.log(JSON.stringify({ nodes: st.nodes, links: st.links,\n"
+            "  dangling: st.danglingLinks, painted: st.painted, tris: st.triangles }));")
+        self.assertGreater(out["nodes"], 0)
+        self.assertEqual(out["links"], 1, "only the real edge survives")
+        self.assertGreaterEqual(out["dangling"], 2)
+        self.assertTrue(out["painted"])
+        self.assertGreater(out["tris"], 0)
+
+    def test_a_prototype_keyed_node_id_is_not_a_dangling_parent(self):
+        # the same key as a NODE id: it must be a real node, not read as absent
+        out = self._run("river_proto_node.js",
+            "const river = R.create(HOST, {});\n"
+            "const m = R.layout(chain(12), false);\n"
+            "m.nodes[5].id = 'toString';\n"
+            "const ls = [{ from: m.nodes[4].id, to: 'toString' },\n"
+            "  { from: 'toString', to: m.nodes[6].id }];\n"
+            "river.setData(m.nodes, ls, {});\n"
+            "river.renderOnce();\n"
+            "const st = river.stats();\n"
+            "console.log(JSON.stringify({ nodes: st.nodes, links: st.links,\n"
+            "  dangling: st.danglingLinks, painted: st.painted }));")
+        self.assertEqual(out["nodes"], 12)
+        self.assertEqual(out["links"], 2, "both edges land on the real node")
+        self.assertEqual(out["dangling"], 0)
+        self.assertTrue(out["painted"])
+
+    def test_the_newest_event_is_the_hot_end_of_the_session(self):
+        # cooling is anchored at the newest event: the freshest node keeps its
+        # own hue at full strength and the oldest node is the coolest.  The
+        # reference is the session, never the wall clock.
+        out = self._run("river_cool_dir.js",
+            "const river = R.create(HOST, {});\n"
+            "const items = [];\n"
+            "for (var i = 0; i < 40; i++)\n"
+            "  items.push({ id: 'e' + i, source: { id: 'e' + i, ts: 1000 + i * 10,\n"
+            "    type: 'reason', actor: 'codex' } });\n"
+            "const m = R.layout(items, false);\n"
+            "const ls = m.nodes.slice(1).map(function (k, i) { return { from: m.nodes[i].id, to: k.id }; });\n"
+            "river.setData(m.nodes, ls, {});\n"
+            "const nodes = river.nodes();\n"
+            "// the two landmarks carry their own rows; skip index 0 for the span\n"
+            "const buckets = nodes.slice(1).map(function (n) { return n.bucket; });\n"
+            "console.log(JSON.stringify({ oldest: nodes[1].bucket, newest: nodes[nodes.length - 1].bucket,\n"
+            "  buckets: buckets, hot: Math.min.apply(null, buckets), cold: Math.max.apply(null, buckets) }));")
+        # bucket 0 is the FRESHEST (its own hue at full strength); the largest
+        # bucket is the oldest.  So newest < oldest, and the span is bounded, so
+        # the oldest node still keeps most of its own colour.
+        self.assertLess(out["newest"], out["oldest"], "the newest node must be the hottest")
+        self.assertEqual(out["newest"], out["hot"], "the freshest node is bucket 0")
+        self.assertEqual(out["oldest"], out["cold"], "the oldest plain node is the coolest")
+        self.assertGreater(out["cold"], out["hot"])
+        self.assertLess(out["cold"], 110, "even the oldest node must keep its own hue")
+
+
+class RiverSceneSurvivalTests(unittest.TestCase):
+    """No single bad record may blank the canvas: setData() is atomic, keeps the
+    previous correct scene, and reports the failure to the journal."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.node = shutil.which("node")
+        cls.river_src = RiverModeTests._read("static", "js", "river.js")
+
+    def _run(self, name, body):
+        if not self.node:
+            self.skipTest("node is not available")
+        river_path = os.path.join(PROJECT_ROOT, "static", "js", "river.js")
+        script = os.path.join(PROJECT_ROOT, ".tmp", name)
+        os.makedirs(os.path.dirname(script), exist_ok=True)
+        with io.open(script, "w", encoding="utf-8") as handle:
+            handle.write(RiverPaintTests._harness_text(body, river_path))
+        proc = subprocess.run([self.node, script], cwd=PROJECT_ROOT, stdout=subprocess.PIPE,
+                              stderr=subprocess.STDOUT, timeout=120)
+        self.assertEqual(proc.returncode, 0, proc.stdout.decode("utf-8", "replace"))
+        return json.loads(proc.stdout.decode("utf-8", "replace"))
+
+    def test_set_data_is_transactional(self):
+        src = self.river_src
+        self.assertIn("function setDataInner(", src)
+        self.assertIn("return setDataInner(riverNodes, links, opts2);", src)
+        i = src.find("function setData(riverNodes, links, opts2) {")
+        self.assertIn("try {", src[i:i + 200])
+        self.assertIn("warn(", src[i:i + 600])
+
+    def test_a_throwing_record_keeps_the_previous_scene(self):
+        out = self._run("river_atomic.js",
+            "const river = R.create(HOST, {});\n"
+            "feed(river, chain(80));\n"
+            "const before = river.stats();\n"
+            "// a getter that throws halfway through the node pass\n"
+            "const hostile = { id: 'boom', type: 'reason', actor: 'codex', ts: 1,\n"
+            "  get x() { throw new Error('bad record'); } };\n"
+            "const res = river.setData([hostile], [], {});\n"
+            "river.renderOnce();\n"
+            "const after = river.stats();\n"
+            "console.log(JSON.stringify({ beforeNodes: before.nodes, afterNodes: after.nodes,\n"
+            "  painted: after.painted, tris: after.triangles, warned: after.warnings,\n"
+            "  last: after.lastWarning, err: res && res.error ? res.error : null,\n"
+            "  resNodes: res.added }));")
+        self.assertGreater(out["beforeNodes"], 0)
+        self.assertGreater(out["afterNodes"], 0, "the previous scene must survive")
+        self.assertTrue(out["painted"], "the canvas must still hold a frame")
+        self.assertGreater(out["tris"], 0)
+        self.assertGreaterEqual(out["warned"], 1, "the failure must reach the journal")
+        self.assertIn("сборка сцены", out["last"])
+        self.assertTrue(out["err"], "setData must report the failure, not throw")
 
 
 class PackagingTests(unittest.TestCase):

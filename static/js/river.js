@@ -34,12 +34,23 @@ window.GRAFFRiver = (function () {
     user: "#d8b4fe",
     start: "#7dff5a",
     end: "#ffd60a",
-    cold: "#3b2a7d"
+    /* "cold" is not grey: an old node keeps its own hue, dimmed and pulled a
+       little towards noble blue-violet, so a long session stays colourful
+       instead of collapsing into a grey mat. */
+    cold: "#5a3fa8"
   };
   var TYPE_ORDER = ["reason", "message", "tool_call", "tool_result", "file_edit", "error"];
 
   // how far an old node drifts from its own colour into the deep violet
   var COOL_MIX = 0.82;
+
+  /* A NULL-PROTOTYPE id map.  An id such as "constructor" or "toString" must
+     read back as "absent", never as an inherited Object.prototype member: with a
+     plain {} such a key passes a `=== undefined` guard, the loop then indexes
+     nodeList by a function and the undefined reaches rowOf() -- the exact
+     "Cannot read properties of undefined (reading 'endOfStream')" crash this
+     whole path exists to prevent. */
+  function newIdMap() { return Object.create(null); }
 
   // ---------------------------------------------------------------- //
   // geometry of the stream (all positions are pure functions of the slot)
@@ -53,19 +64,48 @@ window.GRAFFRiver = (function () {
   // ---------------------------------------------------------------- //
   // animation budget
   // ---------------------------------------------------------------- //
-  var FRESH_MS = 9000;      // younger than this -> the halo keeps pulsing
-  var FRESH_CAP = 400;      // at most this many nodes animated per frame
+  var FRESH_MS = 2600;      // younger than this -> appearance + halo pulse
+  var FRESH_CAP = 240;      // at most this many nodes animated per frame
   var APPEAR_MS = 200;      // appearance: scale 0.6 -> 1.0
   var FLASH_MS = 700;       // arrival flash decay
   var ERROR_FLASH_MS = 2400;// errors hold their red flash much longer
-  var SPARK_POOL = 48;      // live sparks, never thousands
+  var SPARK_POOL = 24;      // live sparks, never thousands
   var SPARK_TRAIL = 5;      // trail samples per spark
   var SPARK_STAGGER_MS = 45;// a batch leaves one after another, not in one volley
+  var SPARK_STAGGER_MAX = 6; // ... but never more than this many in ONE frame
   var SPARK_SPEED = 0.9;    // world units per millisecond
   var SPARK_MIN_MS = 300;
   var SPARK_MAX_MS = 600;
-  var RECOLOUR_MS = 4000;   // cooling is a colour property, not a per-frame effect
-  var IDLE_MS = 500;        // nothing animating: a slow tick, not a frozen canvas
+  var RECOLOUR_MS = 1200;   // cooling is batched: a few times a second at most
+  var IDLE_MS = 2500;       // quiet this long -> the loop parks on the last frame
+  var IDLE_TICK_MS = 1200;  // ... but while lingering, tick at most this often
+  var UPLOAD_RING = 256;    // ring of recent upload bursts for the rate metric
+  var LINK_PX = 3;          // link thickness in pixels (WebGL ignores linewidth)
+  var HALO_GROW = 2.35;     // halo radius as a multiple of the core radius
+  var HALO_OPACITY = 0.8;   // ... and how bright that second pass is
+  var MAX_DPR = 1.25;       // a big scene must never burn fill rate on 4x DPR
+
+  // ---------------------------------------------------------------- //
+  // node colour: a saturated core, weighted by the type's own loudness.
+  // Everything here is a table lookup - the frame loop may not allocate,
+  // so it never builds a colour string and never mixes two rgb objects.
+  // ---------------------------------------------------------------- //
+  var TYPE_KEYS = ["reason", "message", "tool_call", "tool_result", "file_edit", "error", "user"];
+  var TYPE_GAIN = [1.22, 1.0, 1.32, 1.3, 1.3, 1.7, 1.08];     // errors shout loudest
+  /* How far each type recedes into the cold hue at the FAR end of the session.
+     Never 1: grey is exactly the failure this fixes, so every type keeps a
+     strong part of its own signal colour.  Messages (near white) recede a bit
+     more, errors the least, so red still reads as "error" at any age. */
+  var TYPE_COLD = [0.45, 0.58, 0.44, 0.42, 0.44, 0.3, 0.5];
+  var COLD_MIN = 0.0;       // the far end: the table's own cold mix applies in full
+  var COLD_DECAY = 1.0;     // linear in the session position (no early grey-out)
+  var HALO_BASE = 0.42;     // halo brightness of a settled node
+  var HALO_FRESH = 1.5;     // ... and of a node that has just arrived
+  var HALO_CORE_SEG_W = 5;  // the halo is a soft blob, so a coarse sphere is plenty
+  var HALO_CORE_SEG_H = 3;
+  var RECOLOUR_BATCH = 600; // nodes whose colour is refreshed per recolour tick
+  var UPLOAD_WINDOW_MS = 1000;  // rolling window of the re-uploads/second figure
+  var SESSION_COOL_SPAN = 0.30;      // how much of the table the whole session may use
 
   function rgb(hexColor) {
     var v = String(hexColor).replace("#", "");
@@ -207,16 +247,23 @@ window.GRAFFRiver = (function () {
   // A slot maps to a point of the snaked stream: bands run left to right, then
   // the next one starts on the right again (boustrophedon), so a long session
   // never becomes one endless line.
-  function coordsFor(slot) {
+  function coordsFor(slot, depthAbs) {
     var band = Math.floor(slot / BAND_CAP);
     var col = slot % BAND_CAP;
     var right = (band % 2) === 0;
+    // Two nodes of one depth never share a lane: the ordinal of the slot within
+    // its (band, depth) pair shifts y, so a long chain fans into a shallow comb
+    // and the links BETWEEN the lanes are plainly visible without any physics.
+    var place = (slot * 7 + (depthAbs || 0)) * 5;
+    var ordinal = right ? place % 17 : (place * 5 + 3) % 17;
     return {
       x: (right ? col : (BAND_CAP - 1 - col)) * STEP_X,
+      y: (ordinal - 8) * 26,
       z: -band * BAND_DEPTH,
       band: band,
       col: col,
-      right: right
+      right: right,
+      ordinal: ordinal
     };
   }
 
@@ -230,28 +277,40 @@ window.GRAFFRiver = (function () {
 
   function layout(items, collapse) {
     var nodes = packRuns(items, collapse);
-    var byId = {};
-    var byRaw = {};
+    var byId = newIdMap();
+    var byRaw = newIdMap();
     var i, j, k;
     for (i = 0; i < nodes.length; i++) {
       var n = nodes[i];
       byId[n.id] = n;
       n.rawIds = rawIdsOf(n);
       for (j = 0; j < n.rawIds.length; j++) byRaw[n.rawIds[j]] = n;
-      var c = coordsFor(n.slot);
-      n.x = c.x;
-      n.z = c.z;
-      n.band = c.band;
-      n.col = c.col;
       n.anchor = n.members[0];
       n.isGroup = n.count > 1;
       n.parentRawId = (n.members[0].source && n.members[0].source.parent) || null;
     }
-    // branch ordinal among siblings, assigned in slot order (append-only)
-    var seen = {};
+    // A node's position is a pure function of (slot, depth), so the position of
+    // a node is fixed the moment it arrives and NEVER changes, whatever arrives
+    // later.  That is the invariant the whole view rests on.
+    for (i = 0; i < nodes.length; i++) {
+      var m = nodes[i];
+      m.parentRiver = m.parentRawId ? (byRaw[m.parentRawId] || null) : null;
+      var depth = 0;
+      var walker = m, guard = 0;
+      while (walker && walker.parentRiver && guard++ < 4000) { walker = walker.parentRiver; depth++; }
+      var c = coordsFor(m.slot, depth);
+      m.depth = depth;
+      m.x = c.x;
+      m.y = c.y;
+      m.z = c.z;
+      m.band = c.band;
+      m.col = c.col;
+      m.ordinal = c.ordinal;
+    }
+    // Sibling ordinal (kept for callers of the model; no longer drives y)
+    var seen = newIdMap();
     for (i = 0; i < nodes.length; i++) {
       var node = nodes[i];
-      node.parentRiver = node.parentRawId ? (byRaw[node.parentRawId] || null) : null;
       var ord = 0;
       if (node.parentRiver) {
         ord = seen[node.parentRiver.id] || 0;
@@ -259,17 +318,6 @@ window.GRAFFRiver = (function () {
       }
       node.ord = ord;
     }
-    // y = parent y + branch offset (memoised, guard against odd data)
-    function yOf(n) {
-      if (n.y !== undefined) return n.y;
-      if (n._walking) { n.y = 0; return 0; }
-      n._walking = true;
-      var py = n.parentRiver ? yOf(n.parentRiver) : 0;
-      n.y = py + branchOffset(n.ord) * BRANCH_STEP;
-      n._walking = false;
-      return n.y;
-    }
-    for (i = 0; i < nodes.length; i++) yOf(nodes[i]);
     return { nodes: nodes, byId: byId, byRaw: byRaw };
   }
 
@@ -318,6 +366,14 @@ window.GRAFFRiver = (function () {
   var MAX_NODES = 6000;   // instance capacity; the real cap is applied by the app
   var MAX_LINKS = 12000;
 
+  // Dirty flags: an instanced buffer is re-uploaded ONLY when something it
+  // holds actually changed.  Re-uploading everything every frame was the
+  // single biggest cost of this scene.
+  var DIRTY_MATRIX = 1, DIRTY_COLOR = 2, DIRTY_LINK = 4, DIRTY_LINKCOLOR = 8, DIRTY_SPARK = 16;
+
+
+  // A soft radial falloff, white so the instance colour tints it.  It is the
+  // map of the halo pass; it is created once and shared.
   function glowTexture() {
     var size = 128;
     var canvas = document.createElement("canvas");
@@ -326,8 +382,8 @@ window.GRAFFRiver = (function () {
     var ctx = canvas.getContext("2d");
     var g = ctx.createRadialGradient(size / 2, size / 2, 0, size / 2, size / 2, size / 2);
     g.addColorStop(0.0, "rgba(255,255,255,1)");
-    g.addColorStop(0.25, "rgba(255,255,255,0.55)");
-    g.addColorStop(0.55, "rgba(255,255,255,0.16)");
+    g.addColorStop(0.18, "rgba(255,255,255,0.78)");
+    g.addColorStop(0.45, "rgba(255,255,255,0.26)");
     g.addColorStop(1.0, "rgba(255,255,255,0)");
     ctx.fillStyle = g;
     ctx.fillRect(0, 0, size, size);
@@ -336,10 +392,139 @@ window.GRAFFRiver = (function () {
     return tex;
   }
 
+  // ---------------------------------------------------------------- //
+  // Nodes: one unlit sphere geometry per surface, one shared texture.  The
+  // scene must not depend on lights, so both materials are MeshBasicMaterial
+  // (no normal matrix, no lighting chunk).
+  // ---------------------------------------------------------------- //
+  var CORE_SEG_W = 6, CORE_SEG_H = 4;   // 36 triangles per core, 6x fewer than 12x10
+  // The halo is a soft blob with no lighting, so it can afford to be coarser
+  // than the core.  A 5x3 sphere has 30 triangles instead of 36 and, because it
+  // is drawn additively, the fewer overlapping shells the cleaner the bloom.
+  function coreGeometry(THREE_) { return new THREE_.SphereGeometry(1, CORE_SEG_W, CORE_SEG_H); }
+
+  function coreMaterial(THREE_, dpr) {
+    var mat = new THREE_.MeshBasicMaterial({ vertexColors: true, toneMapped: false });
+    mat.onBeforeCompile = function (shader) {
+      // The core is a tiny sphere; a flat disc reads the same and costs
+      // nothing.  Instance scaling happens in the vertex stage, after this.
+      shader.vertexShader = "uniform float uShrink;\n" + shader.vertexShader.replace(
+        "#include <begin_vertex>", "#include <begin_vertex>\n\ttransformed *= uShrink;");
+      shader.uniforms.uShrink = { value: 0.62 };
+    };
+    return mat;
+  }
+
+  // The halo: the same sphere drawn a second time, bigger and additive.  The
+  // vertex stage grows the instance; the fragment stage makes a HOT core bloom
+  // harder than a settled one, by gating on the luminance of the instance
+  // colour three already passes in as vColor (USE_INSTANCING_COLOR).  That gate
+  // is per-instance and costs nothing: no extra attribute, no extra upload, no
+  // per-node object.  It is also why the whole thing reads on a dark background:
+  // an earlier version folded the "halo" factor into the core rgb and clamped it
+  // to white, so the second pass could never appear at all.
+  function haloMaterial(THREE_, dpr) {
+    var mat = new THREE_.MeshBasicMaterial({
+      color: 0xffffff, transparent: true, opacity: HALO_OPACITY, depthWrite: false,
+      blending: THREE_.AdditiveBlending, toneMapped: false
+    });
+    mat.onBeforeCompile = function (shader) {
+      shader.vertexShader = "uniform float uGrow;\n" + shader.vertexShader.replace(
+        "#include <begin_vertex>", "#include <begin_vertex>\n\ttransformed *= uGrow;");
+      shader.uniforms.uGrow = { value: HALO_GROW };
+      shader.fragmentShader = shader.fragmentShader.replace(
+        "#include <color_fragment>",
+        "#include <color_fragment>\n\tfloat g = clamp(dot(vColor.rgb, vec3(0.6, 0.3, 0.1)) * 1.2, 0.45, 1.25);\n" +
+        "\tdiffuseColor.a *= g;");
+    };
+    return mat;
+  }
+
+  // ---------------------------------------------------------------- //
+  // Links: a camera-facing quad per edge, two triangles, one shared
+  // vertex-coloured geometry, therefore ONE draw call whatever the edge
+  // count.  WebGL ignores linewidth, which is exactly why the old line
+  // version was almost invisible.
+  // ---------------------------------------------------------------- //
+  var LINK_VERTS = 6;    // two triangles per edge
+
+  function linkMaterial(THREE_, dpr) {
+    // A custom shader: the ribbon is built in pixels of the screen, so it always
+    // faces the camera and its thickness is a screen width, not a world size.
+    // Every triangle pair shares this one program -> one draw call.
+    //
+    // The quad SPANS BOTH ENDPOINTS (corner.y mixes A -> B).  An earlier version
+    // laid the rib on endpoint A only, which collapsed every edge to a zero-area
+    // sliver: that is why no link was visible in the real renderer.
+    return new THREE_.ShaderMaterial({
+      uniforms: {
+        uPx: { value: LINK_PX * (1 + (dpr - 1) * 0.25) },
+        uOpacity: { value: 0.85 },
+        resolution: { value: new THREE_.Vector2(1280, 720) }
+      },
+      vertexShader: [
+        "#define LINK_STEM 1",
+        // declared here on purpose: three only emits this for USE_COLOR, and a
+        // ShaderMaterial with vertexColors:false never defines it
+        "attribute vec3 color;",
+        "attribute vec3 other;",
+        "attribute vec2 corner;",
+        "uniform float uPx;",
+        "uniform vec2 resolution;",
+        "varying vec3 vColor;",
+        "void main() {",
+        "  vec4 cA = projectionMatrix * modelViewMatrix * vec4(position, 1.0);",
+        "  vec4 cB = projectionMatrix * modelViewMatrix * vec4(other, 1.0);",
+        "  float wA = max(abs(cA.w), 1e-5);",
+        "  float wB = max(abs(cB.w), 1e-5);",
+        "  vec2 sA = cA.xy / wA;",
+        "  vec2 sB = cB.xy / wB;",
+        "  vec2 dirPx = (sB - sA) * resolution;",
+        "  float lenPx = length(dirPx);",
+        "  vec2 dPx = lenPx > 1e-4 ? dirPx / lenPx : vec2(1.0, 0.0);",
+        "  vec2 nPx = vec2(-dPx.y, dPx.x);",
+        "  vec2 mid = mix(sA, sB, corner.y);",
+        "  vec2 midPx = mid * resolution;",
+        "  float w = max(uPx, 1.0);",
+        "  vec2 off = nPx * corner.x * w * 0.5;",
+        "  vec2 ndc = (midPx + off) / max(resolution, vec2(1.0));",
+        "  gl_Position = vec4(ndc, mix(cA.z, cB.z, corner.y), 1.0);",
+        "  vColor = color;",
+        "}"
+      ].join("\n"),
+      fragmentShader: [
+        "uniform float uOpacity;",
+        "varying vec3 vColor;",
+        "void main() {",
+        "  gl_FragColor = vec4(vColor, uOpacity);",
+        "}"
+      ].join("\n"),
+      vertexColors: false, transparent: true, depthWrite: false,
+      depthTest: true, blending: THREE_.AdditiveBlending, toneMapped: false
+    });
+  }
+
   function create(host, opts) {
     opts = opts || {};
     var THREE_ = window.THREE;
     if (!THREE_) return null;
+
+    // A malformed record (a dangling edge, a node without an id) is COUNTED and
+    // reported instead of throwing: one bad row may never blank the canvas.
+    var warnHandler = (typeof opts.onWarn === "function") ? opts.onWarn : null;
+    var warnings = 0, lastWarning = "";
+    function warn(msg) {
+      warnings++;
+      lastWarning = msg;
+      if (warnHandler) { try { warnHandler(msg); } catch (e) {} }
+    }
+
+    // ---- scene-wide handles, assigned further down ------------------------- //
+    var linkLines = null;   // the ribbon mesh (one draw call for every edge)
+    var linkGeo = null, linkPos = null, linkOther = null, linkCol = null;
+    var linkDpr = 1;        // pixel ratio the ribbon width was calibrated for
+    var writtenNodes = 0, writtenLinks = 0;
+    var dangling = 0;       // links whose endpoint is not in the scene
 
     var headless = !!opts.headless;
     var scene = new THREE_.Scene();
@@ -353,50 +538,69 @@ window.GRAFFRiver = (function () {
       try {
         renderer = new THREE_.WebGLRenderer({ antialias: !opts.perf, alpha: false });
         renderer.setClearColor(0x04070c, 1);
+        // Preflight: an untouched GL canvas shows whatever the driver left in
+        // it (usually black/transparent).  Clearing once right here means the
+        // very first visible state is the scene background, never a blank slate.
+        try { renderer.clear(); } catch (e) {}
         if (host && renderer.domElement) host.appendChild(renderer.domElement);
       } catch (e) {
         renderer = null;
       }
     }
 
-    // ---- core spheres (instanced) ---- //
-    var coreGeo = new THREE_.SphereGeometry(1, 12, 10);
-    var coreMat = new THREE_.MeshBasicMaterial({ vertexColors: true });
+    // ---- node cores: one instanced sphere with instanced colour ---------- //
+    // The scene has no lights at all (every material is unlit), so nothing
+    // depends on a normal matrix and nothing has to be recomputed per frame.
+    var dpr = opts.perf === false ? Math.min(window.devicePixelRatio || 1, MAX_DPR) : 1;
+    linkDpr = dpr;
+    var coreGeo = coreGeometry(THREE_);
+    var coreMat = coreMaterial(THREE_, dpr);
     var cores = new THREE_.InstancedMesh(coreGeo, coreMat, MAX_NODES);
     cores.instanceMatrix.setUsage(THREE_.DynamicDrawUsage);
     cores.count = 0;
     cores.frustumCulled = false;
-    // allocate the colour buffer once (per-instance colour, one draw call)
     var white = new THREE_.Color(0xffffff);
     for (var ci = 0; ci < MAX_NODES; ci++) cores.setColorAt(ci, white);
     scene.add(cores);
 
-    // ---- halos (one additive points cloud) ---- //
-    var haloGeo = new THREE_.BufferGeometry();
-    var haloPos = new Float32Array(MAX_NODES * 3);
-    var haloCol = new Float32Array(MAX_NODES * 3);
-    haloGeo.setAttribute("position", new THREE_.BufferAttribute(haloPos, 3));
-    haloGeo.setAttribute("color", new THREE_.BufferAttribute(haloCol, 3));
-    var haloMat = new THREE_.PointsMaterial({
-      size: 44, sizeAttenuation: true, map: glowTexture(), vertexColors: true,
-      blending: THREE_.AdditiveBlending, transparent: true, depthWrite: false, opacity: 0.9
-    });
-    var halos = new THREE_.Points(haloGeo, haloMat);
+    // ---- halos: the SAME instances, the SAME geometry and the SAME matrix
+    // buffer, drawn a second time bigger and additive.  One extra draw call
+    // for the whole scene - never one object (or sprite) per node. ---------- //
+    var haloMat = haloMaterial(THREE_, dpr);
+    var halos = new THREE_.InstancedMesh(coreGeo, haloMat, MAX_NODES);
+    halos.instanceMatrix = cores.instanceMatrix;   // shared: uploaded once
+    halos.count = 0;
     halos.frustumCulled = false;
+    halos.renderOrder = 2;
     scene.add(halos);
 
-    // ---- links (one LineSegments, gradient parent -> child) ---- //
-    var linkGeo = new THREE_.BufferGeometry();
-    var linkPos = new Float32Array(MAX_LINKS * 6);
-    var linkCol = new Float32Array(MAX_LINKS * 6);
+    // ---- links: a camera-facing ribbon per edge, two triangles each, in one
+    // shared vertex-coloured geometry -> ONE draw call at any edge count. --- //
+    var linkCap = MAX_LINKS * LINK_VERTS;
+    linkGeo = new THREE_.BufferGeometry();
+    linkPos = new Float32Array(linkCap * 3);      // the near endpoint
+    linkOther = new Float32Array(linkCap * 3);    // the far endpoint
+    linkCol = new Float32Array(linkCap * 3);      // gradient parent -> child
+    // (side, end): the quad spans endpoint A -> endpoint B, so corner.y mixes
+    // the two projected endpoints and the ribbon is the whole edge.
+    var linkCorner = new Float32Array(linkCap * 2);
     linkGeo.setAttribute("position", new THREE_.BufferAttribute(linkPos, 3));
+    linkGeo.setAttribute("other", new THREE_.BufferAttribute(linkOther, 3));
     linkGeo.setAttribute("color", new THREE_.BufferAttribute(linkCol, 3));
-    var linkMat = new THREE_.LineBasicMaterial({
-      vertexColors: true, transparent: true, opacity: 0.5,
-      blending: THREE_.AdditiveBlending, depthWrite: false
-    });
-    var linkLines = new THREE_.LineSegments(linkGeo, linkMat);
+    linkGeo.setAttribute("corner", new THREE_.BufferAttribute(linkCorner, 2));
+    (function () {
+      var c = [-1, 0, 1, 0, 1, 1, -1, 0, 1, 1, -1, 1];   // the two triangles
+      for (var e = 0; e < MAX_LINKS; e++) {
+        for (var v = 0; v < LINK_VERTS; v++) {
+          linkCorner[(e * LINK_VERTS + v) * 2] = c[v * 2];
+          linkCorner[(e * LINK_VERTS + v) * 2 + 1] = c[v * 2 + 1];
+        }
+      }
+    })();
+    var linkMat = linkMaterial(THREE_, dpr);
+    linkLines = new THREE_.Mesh(linkGeo, linkMat);
     linkLines.frustumCulled = false;
+    linkLines.renderOrder = 1;
     scene.add(linkLines);
 
     // ---- sparks (one additive points pool) ---- //
@@ -453,6 +657,7 @@ window.GRAFFRiver = (function () {
         drag = { x: e.clientX, y: e.clientY, button: (ev.button === 2 ? 2 : 0) };
         userMoved = true;
         followTarget = null;
+        wake();          // a parked loop would otherwise ignore the user
       }
       function onMove(ev) {
         if (!drag) return;
@@ -469,6 +674,7 @@ window.GRAFFRiver = (function () {
           phi = Math.max(0.05, Math.min(Math.PI - 0.05, phi - dy * 0.006));
         }
         applyCamera();
+        wake();
       }
       function onUp() { drag = null; }
       function onWheel(ev) {
@@ -476,6 +682,7 @@ window.GRAFFRiver = (function () {
         radius = Math.max(MIN_R, Math.min(MAX_R, radius * (1 + (d > 0 ? 0.12 : -0.12))));
         userMoved = true;
         applyCamera();
+        wake();
         if (ev.preventDefault) ev.preventDefault();
       }
       host.addEventListener("mousedown", onDown);
@@ -500,7 +707,7 @@ window.GRAFFRiver = (function () {
     // ------------------------------------------------------------ //
     var state_linksVisible = true;
     var nodeList = [];      // river nodes, index == instance index
-    var indexOfId = {};     // river id -> instance index
+    var indexOfId = newIdMap();     // river id -> instance index
     var linkList = [];      // {from, to, fromIdx, toIdx, color, len}
     var sceneNodes = 0;
     var sceneLinks = 0;
@@ -508,31 +715,189 @@ window.GRAFFRiver = (function () {
     var newestTs = 0;
     var active = [];        // indices still animating (fresh / flashing)
 
-    var WHITE_COLOR = new THREE_.Color(0xffffff);
+    // ---- per-node colour: allocation-free ---------------------------------- //
+    // The colour of a node only depends on (type, actor, age-in-session), so a
+    // 128-bucket table per type is computed ONCE.  Every node then holds a
+    // bucket plus an appearance factor, and the render loop is pure arithmetic:
+    // no new THREE.Color, no rgb object, no hex string, ever.
+    var COLOUR_BUCKETS = 128;
+    var colourTable = null;      // built once in create(); the row per type
+    var typeSlot = null;         // type key -> row in the table
+    var rowReason = 0, rowError = 0, rowStart = 0, rowEnd = 0, rowUser = 0;
+
+    // Idempotent: the rows are pure functions of the palette, so one build
+    // serves every scene of the page lifetime.
+    function buildColourTable() {
+      if (colourTable) return;
+      colourTable = [];
+      typeSlot = Object.create(null);
+      rowReason = 0;
+      for (var t = 0; t < TYPE_KEYS.length; t++) {
+        var key = TYPE_KEYS[t];
+        typeSlot[key] = t;
+        var base = rgb(key === "user" ? PALETTE.user : (PALETTE[key] || PALETTE.message));
+        var cold = rgb(PALETTE.cold);
+        var gain = TYPE_GAIN[t], coldKeep = TYPE_COLD[t];
+        if (key === "error") cold = { r: 0x6a, g: 0x10, b: 0x33 };
+        var arr = new Float32Array(COLOUR_BUCKETS * 3);
+        for (var b = 0; b < COLOUR_BUCKETS; b++) {
+          var f = b / (COLOUR_BUCKETS - 1);
+          var k = COLD_MIN + (1 - COLD_MIN) * Math.pow(f, COLD_DECAY);
+          k *= coldKeep;
+          arr[b * 3] = Math.min(255, (base.r + (cold.r - base.r) * k) * gain) / 255;
+          arr[b * 3 + 1] = Math.min(255, (base.g + (cold.g - base.g) * k) * gain) / 255;
+          arr[b * 3 + 2] = Math.min(255, (base.b + (cold.b - base.b) * k) * gain) / 255;
+        }
+        colourTable.push(arr);
+      }
+      rowError = typeSlot.error;
+      rowStart = -2;
+      rowEnd = -3;
+      rowUser = typeSlot.user;
+      // The stream's own ends are not a type but a role: they get their own
+      // rows so the palette is honoured without a per-node string.
+      colourTable.push(rowFor("start", PALETTE.start));
+      rowStart = colourTable.length - 1;
+      colourTable.push(rowFor("end", PALETTE.end));
+      rowEnd = colourTable.length - 1;
+      // the group rows: the same hues, pulled towards the cold violet so a
+      // folded run reads as "quieter", not as "grey"
+      var coldRgb = rgb(PALETTE.cold);
+      mutedBase = colourTable.length;
+      for (var g = 0; g < TYPE_KEYS.length; g++) {
+        var gsrc = colourTable[g];
+        var garr = new Float32Array(COLOUR_BUCKETS * 3);
+        for (var gb = 0; gb < COLOUR_BUCKETS * 3; gb += 3) {
+          garr[gb] = gsrc[gb] * 0.62 + coldRgb.r / 255 * 0.38;
+          garr[gb + 1] = gsrc[gb + 1] * 0.62 + coldRgb.g / 255 * 0.38;
+          garr[gb + 2] = gsrc[gb + 2] * 0.62 + coldRgb.b / 255 * 0.38;
+        }
+        colourTable.push(garr);
+      }
+    }
+
+    // A row for the "start of the stream" / "end of the stream" roles: they
+    // never cool, they are a landmark, not an event in the middle of a run.
+    function rowFor(role, hex) {
+      var base = rgb(hex);
+      var arr = new Float32Array(COLOUR_BUCKETS * 3);
+      for (var b = 0; b < COLOUR_BUCKETS; b++) {
+        arr[b * 3] = Math.min(255, base.r * 1.2) / 255;
+        arr[b * 3 + 1] = Math.min(255, base.g * 1.2) / 255;
+        arr[b * 3 + 2] = Math.min(255, base.b * 1.2) / 255;
+      }
+      return arr;
+    }
+
+    function bucketOf(frac) {
+      var b = (frac * (COLOUR_BUCKETS - 1)) | 0;
+      if (b < 0) b = 0; else if (b > COLOUR_BUCKETS - 1) b = COLOUR_BUCKETS - 1;
+      return b;
+    }
+
+    // A group node (a folded "xN" run) is a *quieter* version of its own kind,
+    // never a grey one: the same hue, mixed 25% towards the deep violet.  One
+    // row per type, built once, so the frame loop still only indexes a table.
+    var mutedBase = -1;        // first row of the muted (group) twin table
+
+    // The row a node reads: the first node of the stream is the green landmark,
+    // the last one the yellow one; everything else reads its own type.
+    function rowOf(n) {
+      // Defensive: a node this pass cannot resolve is not allowed to throw.
+      // Without this guard an undefined here is exactly the crash that reported
+      // "Cannot read properties of undefined (reading 'endOfStream')".
+      if (!n || typeof n !== "object") return typeSlot.tool_call === undefined ? 0 : typeSlot.tool_call;
+      if (n.endOfStream) return rowEnd;
+      if (n.startOfStream) return rowStart;
+      var row = typeSlot[n.type];
+      if (row === undefined) row = typeSlot[n.actor === "user" ? "user" : "tool_call"];
+      // a folded "xN" run is the muted but still colourful twin of its type
+      if (n.count > 1 && mutedBase >= 0) return mutedBase + row;
+      return row;
+    }
+
+    // Built here, after the declarations: the frame loop only ever indexes the
+    // table, so colour work is arithmetic instead of strings and allocation.
+    buildColourTable();
+
+    // ---- per-node appearance: bucket + gain, no allocation ----------------- //
+
+    // Which buffers the current pass by writeNode() is allowed to re-upload.
+    // Steady/prepare writes set DIRTY_MATRIX | DIRTY_COLOR; the idle &&!fresh
+    // pass only sets DIRTY_MATRIX, so an already-settled instance colour buffer
+    // is never pushed to the GPU again.
+    // No extra scene objects: the whole picture is the instanced cores, the
+    // additive halo pass and the ribbon mesh.  Everything else (stems, end
+    // markers) used to be separate objects and only added draw calls.
+
+    var passDirty = DIRTY_MATRIX | DIRTY_COLOR;   // what writeNode() may dirty
+    // The span of instances a pass actually touched.  three uploads only
+    // [offset, count) of a buffer, so an animated frame pushes the few hundred
+    // instances that moved instead of the whole 6000-instance capacity.
+    var dirtyMin = -1, dirtyMax = -1;
+    function touch(i) {
+      if (dirtyMin < 0 || i < dirtyMin) dirtyMin = i;
+      if (i > dirtyMax) dirtyMax = i;
+    }
+
+
     var hasMatrix = [];     // instance index -> its matrix was written at least once
     var tmpMatrix = new THREE_.Matrix4();
     var tmpQuat = new THREE_.Quaternion();
     var tmpVec = new THREE_.Vector3();
     var tmpScale = new THREE_.Vector3();
     var tmpColor = new THREE_.Color();
+    var renderDirty = 0;    // which instanced buffers must be re-uploaded
 
-    // A node that is not being animated still has to be on screen: three's
-    // InstancedMesh starts with an all-zero matrix, and a zero matrix draws
-    // nothing at all.  One static write per node is enough, because a river
-    // position never changes once the node exists.
-    function writeSteady(i, now) {
+    // One appearance pass for a single node, used by BOTH the steady write and
+    // every animated frame, so a node never flickers between two code paths.
+    function writeNode(i, now, animated) {
       var n = nodeList[i];
       if (!n) return;
-      if (!n.steady) n.steady = model.coolColor(n.type, 0, n.actor);
+      var row = colourTable[rowOf(n)];
+      var b3 = n.bucket * 3;
+      var cr = row[b3], cg = row[b3 + 1], cb = row[b3 + 2];
+      var scale = NODE_RADIUS;
+      var halo = HALO_BASE;
+      if (animated) {
+        var age = now - n.bornAt;
+        var grow = age < APPEAR_MS ? 0.6 + 0.4 * (age / APPEAR_MS) : 1;
+        var flashMs = n.type === "error" ? ERROR_FLASH_MS : FLASH_MS;
+        var flash = age < flashMs ? (1 - age / flashMs) : 0;
+        var pulse = 0;
+        if (age < FRESH_MS) {
+          var ph = (age - APPEAR_MS) / 700;
+          if (ph > 0) pulse = 0.16 * Math.sin(ph) * (1 - age / FRESH_MS);
+        }
+        scale = NODE_RADIUS * (grow + pulse + flash * (n.type === "error" ? 0.5 : 0.28));
+        halo = HALO_BASE + pulse * 2.2 + flash * (n.type === "error" ? 1.6 : 1.2);
+        if (flash > 0) {
+          // a short white-hot arrival spark, fading back into the node's hue
+          var w = n.type === "error" ? 0.55 * flash : 0.42 * flash;
+          cr += (1 - cr) * w; cg += (1 - cg) * w; cb += (1 - cb) * w;
+        }
+      }
       tmpVec.set(n.x, n.y, n.z);
-      tmpScale.set(NODE_RADIUS, NODE_RADIUS, NODE_RADIUS);
+      tmpScale.set(scale, scale, scale);
       tmpMatrix.compose(tmpVec, tmpQuat, tmpScale);
       cores.setMatrixAt(i, tmpMatrix);
-      var col = tmpColor.set(n.steady);
-      cores.setColorAt(i, col);
-      haloPos[i * 3] = n.x; haloPos[i * 3 + 1] = n.y; haloPos[i * 3 + 2] = n.z;
-      haloCol[i * 3] = col.r; haloCol[i * 3 + 1] = col.g; haloCol[i * 3 + 2] = col.b;
+      cores.setColorAt(i, tmpColor.setRGB(cr, cg, cb));
+      // the halo pass shares this very matrix and this very colour buffer: the
+      // same sphere, drawn a second time bigger and additive for one extra draw
+      // call.  (A hot white core therefore also makes the brightest halo, which
+      // is exactly the "a fresh event glows" reading we want.)
       hasMatrix[i] = true;
+      touch(i);
+      renderDirty |= passDirty;
+    }
+
+    // The "cold" write: position + colour, used the first time a node is drawn.
+    // It runs once per node, during setData, never inside the frame loop.
+    function writeSteady(i, now) {
+      ensureBucket(i);
+      writtenNodes++;
+      renderDirty |= DIRTY_MATRIX | DIRTY_COLOR;
+      writeNode(i, now, false);
     }
 
     function ensureMatrices(now) {
@@ -541,50 +906,74 @@ window.GRAFFRiver = (function () {
       }
     }
 
-    function setNodeAppearance(i, now) {
+    function ensureBucket(i) {
       var n = nodeList[i];
-      var age = now - n.bornAt;
-      // appearance: 0.6 -> 1.0 over APPEAR_MS, then a slow halo pulse while fresh
-      var grow = age < APPEAR_MS ? (0.6 + 0.4 * (age / APPEAR_MS)) : 1;
-      var pulse = 0;
-      if (age < FRESH_MS) {
-        var ph = (age - APPEAR_MS) / 700;
-        if (ph > 0) pulse = 0.16 * Math.sin(ph) * (1 - age / FRESH_MS);
-      }
-      // arrival flash: bright right away, then cools to the steady colour;
-      // errors hold the red flash much longer
-      var flashMs = n.type === "error" ? ERROR_FLASH_MS : FLASH_MS;
-      var flash = age < flashMs ? (1 - age / flashMs) : 0;
-      var scale = NODE_RADIUS * (grow + pulse + flash * (n.type === "error" ? 0.5 : 0.28));
-      tmpVec.set(n.x, n.y, n.z);
-      tmpScale.set(scale, scale, scale);
-      tmpMatrix.compose(tmpVec, tmpQuat, tmpScale);
-      cores.setMatrixAt(i, tmpMatrix);
+      if (!n) return;
+      n.bucket = ageFrac(n);
+    }
 
-      hasMatrix[i] = true;
-      var col = tmpColor.set(n.steady);
-      if (flash > 0) {
-        // flash towards white (cools back to the steady hue on its own)
-        col.lerp(WHITE_COLOR, n.type === "error" ? 0.55 * flash : 0.42 * flash);
-      }
-      cores.setColorAt(i, col);
-
-      haloPos[i * 3] = n.x; haloPos[i * 3 + 1] = n.y; haloPos[i * 3 + 2] = n.z;
-      var hg = 1 + pulse * 3 + flash * 2.4;
-      haloCol[i * 3] = col.r * hg; haloCol[i * 3 + 1] = col.g * hg; haloCol[i * 3 + 2] = col.b * hg;
+    // Everything is animated through the same pass, so an animated node and a
+    // settled one can never disagree about their colour.
+    function setNodeAppearance(i, now) {
+      writeNode(i, now, true);
     }
 
     // Colour of every node for a given "now": young nodes are saturated, old
     // ones slide into the deep violet.  This is a colour property, not a
-    // per-frame effect, so it is recomputed on a slow timer.
+    // per-frame effect, so it is recomputed on a slow timer and the scene is
+    // re-uploaded once - not every frame.
+    // Batched: at most a few hundred colours are recomputed in one tick.  The
+    // cursor walks the whole scene over several seconds, so a cold load cools
+    // gradually and a frame never pays for the whole graph.
+    var recolourCursor = 0;
     function recolour(now) {
-      var span = (newestTs > oldestTs) ? (newestTs - oldestTs) : 0;
-      for (var i = 0; i < sceneNodes; i++) {
-        var n = nodeList[i];
-        var frac = span > 0 ? ((now / 1000) - n.ts) / Math.max(1, span) : 0;
-        if (frac < 0) frac = 0;
-        n.steady = model.coolColor(n.type, frac * 0.9, n.actor);
+      var budget = RECOLOUR_BATCH;
+      var changed = 0;
+      while (budget > 0 && sceneNodes > 0) {
+        if (recolourCursor >= sceneNodes) recolourCursor = 0;
+        var n = nodeList[recolourCursor];
+        var next = ageFrac(n);
+        if (next !== n.bucket) { n.bucket = next; writeNode(recolourCursor, now, false); changed++; }
+        recolourCursor++;
+        budget--;
       }
+      return changed;
+    }
+
+    /* How far along the SESSION a node sits: 0 = the very first event, 1 = the
+       newest.  It is a pure function of the timestamps, so it is fixed the
+       moment the event arrives and it NEVER reads the wall clock.  Measured
+       against the wall clock an old session - the usual case - was uniformly
+       "cold" and every node came out the same grey; anchored to the session it
+       is colourful however long ago it happened. */
+    function sessionFrac(ts) {
+      var span = newestTs - oldestTs;
+      if (span <= 0) return 0.42;                   // a single event: near the middle
+      var frac = (ts - oldestTs) / span;
+      if (frac < 0) return 0;
+      if (frac > 1) return 1;
+      return frac;
+    }
+
+    /* The cooling AGE, read against the session and anchored at the NEWEST
+       event: 0 = just happened (its own type colour, at full strength),
+       1 = the oldest event of the session (the deep blue-violet).  So an ember
+       cools exactly as time passes, and the reference point is the freshest
+       event - never the wall clock.  The span is capped so even the oldest node
+       keeps most of its own hue instead of collapsing into grey. */
+    function coolAge(ts) {
+      return (1 - sessionFrac(ts)) * (1 - SESSION_COOL_SPAN);
+    }
+
+    // The colour bucket of a node, recomputed only when a NEW event extends the
+    // session window and shifts everything slightly towards cool.
+    function ageFrac(n) { return ageFracOf(n.ts); }
+
+    // The same bucket for a bare timestamp, so the append path (which holds a
+    // river node, not a scene node, and therefore has no n.bucket field yet)
+    // computes exactly what the recolour pass will compute later.
+    function ageFracOf(ts) {
+      return bucketOf(coolAge(ts));
     }
 
     // Only fresh nodes are animated.  A cold load of a 4000-node session would
@@ -606,6 +995,17 @@ window.GRAFFRiver = (function () {
     // rebuild from the packed river model
     // ------------------------------------------------------------ //
     function setData(riverNodes, links, opts2) {
+      try {
+        return setDataInner(riverNodes, links, opts2);
+      } catch (e) {
+        // The scene must survive a record nobody anticipated.  The previous,
+        // correct frame stays on screen; the failure is named in the journal.
+        warn("русло: сборка сцены пропущена: " + (e && e.message ? e.message : String(e)));
+        return { added: 0, indices: [], first: false, error: String(e && e.message ? e.message : e) };
+      }
+    }
+
+    function setDataInner(riverNodes, links, opts2) {
       opts2 = opts2 || {};
       var now = nowMs();
       var prevCount = nodeList.length;
@@ -613,8 +1013,12 @@ window.GRAFFRiver = (function () {
 
       // nodes: append-only.  A node that already exists keeps its index and
       // its computed coordinates, so nothing on screen moves.
+      if (!riverNodes || !riverNodes.length) riverNodes = [];
+      if (!links || !links.length) links = [];
+      var skippedNodes = 0;
       for (var i = 0; i < riverNodes.length; i++) {
         var rn = riverNodes[i];
+        if (!rn || rn.id === undefined || rn.id === null) { skippedNodes++; continue; }
         var idx = indexOfId[rn.id];
         if (idx === undefined) {
           if (nodeList.length >= MAX_NODES) break;
@@ -622,10 +1026,10 @@ window.GRAFFRiver = (function () {
           indexOfId[rn.id] = idx;
           var n = {
             id: rn.id, index: idx, type: rn.type, actor: rn.actor,
-            x: rn.x, y: rn.y, z: rn.z, slot: rn.slot, band: rn.band,
+            x: rn.x || 0, y: rn.y || 0, z: rn.z || 0, slot: rn.slot || 0, band: rn.band || 0,
             ts: rn.ts, tsLast: rn.tsLast, count: rn.count,
             rn: rn, bornAt: now, seenAt: !opts2.silent ? now : 0,
-            steady: rn.steady || model.coolColor(rn.type, 0, rn.actor)
+            bucket: ageFracOf(rn.ts)
           };
           nodeList.push(n);
           added.push(n);
@@ -636,24 +1040,45 @@ window.GRAFFRiver = (function () {
       }
       sceneNodes = nodeList.length;
 
-      // links: connect the river nodes that correspond to the real parentage
+      // links: connect the river nodes that correspond to the real parentage.
+      // A ribbon needs both endpoints at both of its vertices, so the far
+      // endpoint and the corner are stamped into the shared geometry once here
+      // and are never touched again.
       linkList = [];
-      var seenLink = {};
+      var seenLink = newIdMap();
+      dangling = 0;
       for (var l = 0; l < links.length; l++) {
-        var fromIdx = indexOfId[links[l].from];
-        var toIdx = indexOfId[links[l].to];
-        if (fromIdx === undefined || toIdx === undefined || fromIdx === toIdx) continue;
+        var lk0 = links[l];
+        // A dangling edge (a rolled-up group, a service node, or an event that
+        // the cap pushed out) has no scene node: it is COUNTED and skipped.
+        // `undefined` is what an absent id looks like; a non-numeric index is
+        // treated the same way.  This is the guard for the crash that reported
+        // "Cannot read properties of undefined".
+        var fromIdx = (lk0 && typeof lk0.from === "string") ? indexOfId[lk0.from] : undefined;
+        var toIdx = (lk0 && typeof lk0.to === "string") ? indexOfId[lk0.to] : undefined;
+        if (fromIdx === undefined || toIdx === undefined) { dangling++; continue; }
+        if (fromIdx === toIdx) continue;
         var key = fromIdx + ">" + toIdx;
         if (seenLink[key]) continue;
         seenLink[key] = true;
         var a = nodeList[fromIdx], b = nodeList[toIdx];
+        if (!a || !b) { dangling++; continue; }
         var dist = Math.sqrt((a.x - b.x) * (a.x - b.x) + (a.y - b.y) * (a.y - b.y) + (a.z - b.z) * (a.z - b.z));
-        linkList.push({
-          from: fromIdx, to: toIdx, len: dist,
-          colorFrom: a.steady, colorTo: b.steady
-        });
+        // Trim the end radii so the ribbon starts at the rim of the cause and
+        // stops at the rim of the effect instead of hiding inside the spheres.
+        var trim = dist > 1e-3 ? Math.min(0.25, (NODE_RADIUS * 0.62) / dist) : 0;
+        // The parent is normally the lower index in this append-only model;
+        // "a" and "z" are kept ordered so a data set whose edges point the
+        // other way still costs nothing extra.
+        var a = fromIdx <= toIdx ? fromIdx : toIdx;
+        var z = fromIdx <= toIdx ? toIdx : fromIdx;
+        linkList.push({ from: fromIdx, to: toIdx, a: a, z: z, len: dist, a0: trim, a1: 1 - trim });
       }
       sceneLinks = Math.min(linkList.length, MAX_LINKS);
+      // Report the data problems that used to be invisible: a broken record is
+      // now a line in the journal and a number in the diagnostics panel.
+      if (dangling > 0) warn("русло: пропущено висячих связей — " + dangling);
+      if (skippedNodes > 0) warn("русло: пропущено записей без id — " + skippedNodes);
 
       for (var t = 0; t < riverNodes.length; t++) {
         var tt = riverNodes[t].ts;
@@ -662,22 +1087,14 @@ window.GRAFFRiver = (function () {
       }
 
       cores.count = sceneNodes;
-      halos.geometry.setDrawRange(0, sceneNodes);
-      halos.geometry.attributes.position.needsUpdate = true;
-      halos.geometry.attributes.color.needsUpdate = true;
-
-      recolour(now);
-      var lpos = 0;
-      for (var k = 0; k < sceneLinks; k++) {
-        var lk = linkList[k];
-        var p1 = nodeList[lk.from], p2 = nodeList[lk.to];
-        linkPos[lpos * 3] = p1.x; linkPos[lpos * 3 + 1] = p1.y; linkPos[lpos * 3 + 2] = p1.z;
-        linkPos[lpos * 3 + 3] = p2.x; linkPos[lpos * 3 + 4] = p2.y; linkPos[lpos * 3 + 5] = p2.z;
-        lpos += 2;
-      }
-      linkLines.geometry.setDrawRange(0, sceneLinks * 2);
-      linkGeo.attributes.position.needsUpdate = true;
+      halos.count = sceneNodes;
       linkLines.visible = sceneLinks > 0 && !!state_linksVisible;
+
+      // The link geometry is rebuilt only when the edge set changed, not on
+      // every data update: a ribbon never needs its endpoints refreshed
+      // because a river node never moves.
+      if (sceneNodes !== writtenNodes) rebuildNodeColours(now);
+      if (sceneLinks !== writtenLinks) rebuildLinks();
 
       var addedIndices = [];
       for (var a2 = 0; a2 < added.length; a2++) { addedIndices.push(added[a2].index); active.push(added[a2].index); }
@@ -686,18 +1103,266 @@ window.GRAFFRiver = (function () {
 
       // Data changed: there is now something to show, so the loop must come
       // back even if it had parked itself while the graph was still empty.
+      coolSettled = false; coolQuiet = 0;
       pendingFrame = true;
       if (!document.hidden) start();
 
       return { added: added.length, indices: addedIndices, first: prevCount === 0 };
     }
 
+    // Fill the ribbon geometry of every visible edge.  Called only when the
+    // edge set itself changed: a river node never moves, so the endpoints of an
+    // already drawn link never change either.
+    function rebuildLinks() {
+      var n = sceneLinks;
+      for (var k = 0; k < n; k++) {
+        var lk = linkList[k];
+        var p1 = nodeList[lk.from], p2 = nodeList[lk.to];
+        var ca = colourTable[rowOf(p1)], cb = colourTable[rowOf(p2)];
+        var ba = p1.bucket * 3, bb = p2.bucket * 3;
+        var t0 = lk.a0 || 0, t1 = lk.a1 === undefined ? 1 : lk.a1;
+        var ax = p1.x + (p2.x - p1.x) * t0;
+        var ay = p1.y + (p2.y - p1.y) * t0;
+        var az = p1.z + (p2.z - p1.z) * t0;
+        var bx = p2.x - (p2.x - p1.x) * (1 - t1);
+        var by = p2.y - (p2.y - p1.y) * (1 - t1);
+        var bz = p2.z - (p2.z - p1.z) * (1 - t1);
+        for (var v = 0; v < LINK_VERTS; v++) {
+          var o = (k * LINK_VERTS + v);
+          // endpoint A lives in `position`; endpoint B in `other`, so the quad
+          // spans the WHOLE edge in the vertex shader
+          linkPos[o * 3] = ax; linkPos[o * 3 + 1] = ay; linkPos[o * 3 + 2] = az;
+          linkOther[o * 3] = bx; linkOther[o * 3 + 1] = by; linkOther[o * 3 + 2] = bz;
+          // the rib at the far end belongs to the child's colour: the ribbon
+          // then reads as a gradient from cause to effect
+          var near = (v === 1 || v === 3 || v === 4) ? 1 : 0;
+          linkCol[o * 3] = near ? ca[ba] : cb[bb];
+          linkCol[o * 3 + 1] = near ? ca[ba + 1] : cb[bb + 1];
+          linkCol[o * 3 + 2] = near ? ca[ba + 2] : cb[bb + 2];
+        }
+      }
+      linkGeo.setDrawRange(0, n * LINK_VERTS);
+      renderDirty |= DIRTY_LINK | DIRTY_LINKCOLOR;
+      writtenLinks = n;
+      uploadedLinkGeometry++;
+    }
+
+    // One write per node for the whole scene: the instance matrices, the
+    // instance colours and the links.  This is the "cold" pass a fresh session
+    // pays once; after it, only the nodes that really change are touched.
+    function rebuildNodeColours(now) {
+      var i;
+      for (i = 0; i < sceneNodes; i++) {
+        var n = nodeList[i];
+        // Every node keeps a strong part of its OWN hue: the cold cap is far from
+        // grey on purpose, so a long session is a colourful gradient, not a mat.
+        n.bucket = ageFrac(n);
+        n.startOfStream = (i === 0);
+        n.endOfStream = (i === sceneNodes - 1);
+      }
+      // the landmarks (green start / yellow end) are rows that never cool, so
+      // the bucket is irrelevant for them; the freshest plain node is a bucket 0
+      for (i = 0; i < sceneNodes; i++) writeNode(i, now, false);
+      writtenNodes = sceneNodes;
+    }
+
+    // ------------------------------------------------------------ //
+    // self-check: render one frame and read the pixels BACK.  Counters and
+    // draw calls can all look healthy while the canvas is a grey smear, so the
+    // only honest proof of "the picture is right" is the picture itself.
+    // ------------------------------------------------------------ //
+    var CHECK_W = 160, CHECK_H = 96;
+    var checkTarget = null, checkPixels = null;
+    var checkBuf = new Uint8Array(CHECK_W * CHECK_H * 4);
+    var windingScene = null, windingTarget = null, windingBuf = new Uint8Array(64 * 16 * 4);
+    var linkWindingOk = null;     // null = not tested yet, true/false = measured
+    var lastCheck = null;         // the most recent selfCheck() result
+
+    function ensureCheckTargets() {
+      if (checkTarget || !renderer) return;
+      checkTarget = new THREE_.WebGLRenderTarget(CHECK_W, CHECK_H, { depthBuffer: false, stencilBuffer: false });
+      checkPixels = new Uint8Array(CHECK_W * CHECK_H * 4);
+    }
+
+    /* One straight test edge, drawn with the REAL ribbon material, into a small
+       render target.  Its only job is to answer a question a stub cannot: does
+       this driver actually rasterise the pixel-width quad?  If the answer is
+       no, the app says so instead of quietly showing nothing. */
+    function windingTest() {
+      if (linkWindingOk !== null) return linkWindingOk;
+      if (!renderer) return null;
+      try {
+        if (!windingScene) {
+          // a fat horizontal quad, in its OWN scene: one draw call, and the big
+          // scene is not touched at all
+          windingScene = new THREE_.Scene();
+          var g = new THREE_.BufferGeometry();
+          var w = 400, h = 40;              // a fat quad in world units
+          var pos = [0, 0, 0,  w, 0, 0,  w, h, 0,  0, 0, 0,  w, h, 0,  0, h, 0];
+          var oth = [w, 0, 0,  w, 0, 0,  w, h, 0,  w, 0, 0,  w, h, 0,  w, h, 0];
+          var col = [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1];
+          var cor = [-1, 0, 1, 0, 1, 1, -1, 0, 1, 1, -1, 1];
+          g.setAttribute("position", new THREE_.BufferAttribute(new Float32Array(pos), 3));
+          g.setAttribute("other", new THREE_.BufferAttribute(new Float32Array(oth), 3));
+          g.setAttribute("color", new THREE_.BufferAttribute(new Float32Array(col), 3));
+          g.setAttribute("corner", new THREE_.BufferAttribute(new Float32Array(cor), 2));
+          g.setDrawRange(0, 6);
+          var quad = new THREE_.Mesh(g, linkMat);
+          quad.frustumCulled = false;
+          windingScene.add(quad);
+        }
+        if (!windingTarget) windingTarget = new THREE_.WebGLRenderTarget(64, 16, { depthBuffer: false, stencilBuffer: false });
+        var cam = new THREE_.OrthographicCamera(-1, 1, 1, -1, 0.1, 10);
+        cam.position.set(0, 0, 5);
+        cam.lookAt(0, 0, 0);
+        var prevAspect = camera.aspect;      // the ribbon reads `resolution`
+        camera.aspect = 4;
+        camera.updateProjectionMatrix();
+        if (linkMat.uniforms && linkMat.uniforms.resolution) linkMat.uniforms.resolution.value.set(64, 16);
+        renderer.setRenderTarget(windingTarget);
+        renderer.setClearColor(0x000000, 1);
+        renderer.clear();
+        renderer.render(windingScene, cam);
+        renderer.readRenderTargetPixels(windingTarget, 0, 0, 64, 16, windingBuf);
+        renderer.setRenderTarget(null);
+        renderer.setClearColor(0x04070c, 1);
+        camera.aspect = prevAspect;
+        camera.updateProjectionMatrix();
+        if (linkMat.uniforms && linkMat.uniforms.resolution) {
+          linkMat.uniforms.resolution.value.set(
+            (renderer.domElement && renderer.domElement.clientWidth) || 1280,
+            (renderer.domElement && renderer.domElement.clientHeight) || 720);
+        }
+        var lit = 0;
+        for (var i = 0; i < windingBuf.length; i += 4) {
+          if (windingBuf[i] + windingBuf[i + 1] + windingBuf[i + 2] > 24) lit++;
+        }
+        linkWindingOk = lit > 0;
+      } catch (e) {
+        linkWindingOk = null;
+      }
+      return linkWindingOk;
+    }
+
+    /* Renders one frame into an offscreen target and reads the pixels back.
+       Returns the numbers that expose a "healthy counters, blank canvas" bug:
+       non-black pixels, distinct coarse hues, whether in-between (anti-aliased)
+       pixel values exist -> that is the signature of a LINE, not a blob -> and
+       how many scene nodes projected into the frame. */
+    function selfCheck() {
+      var out = {
+        supported: false, width: CHECK_W, height: CHECK_H,
+        nonBlack: 0, hues: 0, linePixels: 0, nodesInFrame: 0,
+        winding: linkWindingOk, dangling: dangling
+      };
+      if (!renderer) return out;
+      try {
+        ensureCheckTargets();
+        // size the check exactly like the visible canvas, so the projection and
+        // the ribbon math are the ones the user is actually looking at
+        var cw = (renderer.domElement && renderer.domElement.clientWidth) || 0;
+        var ch = (renderer.domElement && renderer.domElement.clientHeight) || 0;
+        if (cw > 8 && ch > 8) {
+          var ar = cw / ch;
+          if (ar >= 1) { CHECK_H = 96; CHECK_W = Math.round(96 * ar); }
+          else { CHECK_W = 160; CHECK_H = Math.round(160 / ar); }
+        }
+        if (checkTarget.width !== CHECK_W || checkTarget.height !== CHECK_H) {
+          checkTarget.setSize(CHECK_W, CHECK_H);
+          checkPixels = new Uint8Array(CHECK_W * CHECK_H * 4);
+        }
+        var prevPixelRatio = null, prevSize = null;
+        try {
+          if (renderer.getPixelRatio) prevPixelRatio = renderer.getPixelRatio();
+          if (renderer.getSize) { prevSize = renderer.getSize(new THREE_.Vector2()); }
+        } catch (e) {}
+        // read PIXELS, not CSS pixels: at DPR 1 the readback is 1:1 with the buffer
+        try { renderer.setPixelRatio(1); } catch (e) {}
+        try { renderer.setSize(CHECK_W, CHECK_H, false); } catch (e) {}
+        var prevAspect = camera.aspect;
+        camera.aspect = CHECK_W / CHECK_H;
+        camera.updateProjectionMatrix();
+        if (linkMat.uniforms && linkMat.uniforms.resolution) {
+          linkMat.uniforms.resolution.value.set(CHECK_W, CHECK_H);
+        }
+        renderer.setRenderTarget(checkTarget);
+        renderer.clear();
+        renderer.render(scene, camera);
+        renderer.readRenderTargetPixels(checkTarget, 0, 0, CHECK_W, CHECK_H, checkPixels);
+        renderer.setRenderTarget(null);
+        // put the real canvas back exactly as it was, and repaint it: a check
+        // must never leave the user staring at a black canvas
+        try { renderer.setPixelRatio(prevPixelRatio || 1); } catch (e) {}
+        if (prevSize) { try { renderer.setSize(prevSize.x, prevSize.y, false); } catch (e) {} }
+        camera.aspect = prevAspect;
+        camera.updateProjectionMatrix();
+        if (linkMat.uniforms && linkMat.uniforms.resolution) {
+          linkMat.uniforms.resolution.value.set(prevSize ? prevSize.x : CHECK_W, prevSize ? prevSize.y : CHECK_H);
+        }
+        renderer.setRenderTarget(null);
+        renderer.render(scene, camera);
+
+        // ---- the analysis: count and bucket, no allocation per pixel -------- //
+        var nonBlack = 0, linePixels = 0;
+        var seen = {};
+        var hues = 0;
+        for (var i = 0; i < checkPixels.length; i += 4) {
+          var r = checkPixels[i], g = checkPixels[i + 1], b = checkPixels[i + 2];
+          var lum = r + g + b;
+          if (lum <= 24) continue;                     // background
+          nonBlack++;
+          // a coarse hue bucket: 5 bits per channel is plenty to tell the
+          // palette apart and cheap enough to run over ~15k pixels
+          var key = ((r >> 5) << 10) | ((g >> 5) << 5) | (b >> 5);
+          if (!seen[key]) { seen[key] = 1; hues++; }
+          // "in-between" brightness on at least one channel is the signature of
+          // a thin, anti-aliased edge; a filled sphere jumps several steps
+          var mx = Math.max(r, g, b), mn = Math.min(r, g, b);
+          if (mx < 250 && mn > 0 && lum < 700 && (mx - mn) < 160) linePixels++;
+        }
+        out.supported = true;
+        out.nonBlack = nonBlack;
+        out.hues = hues;
+        out.linePixels = linePixels;
+        out.width = CHECK_W; out.height = CHECK_H;
+        out.winding = linkWindingOk;
+        out.dangling = dangling;
+
+        // nodes in frame: the same projection the picker uses
+        var inFrame = 0;
+        for (var k = 0; k < sceneNodes; k++) {
+          var n = nodeList[k];
+          tmpVec.set(n.x, n.y, n.z).project(camera);
+          if (tmpVec.z > -1 && tmpVec.z < 1 &&
+              tmpVec.x > -1.1 && tmpVec.x < 1.1 && tmpVec.y > -1.1 && tmpVec.y < 1.1) inFrame++;
+        }
+        out.nodesInFrame = inFrame;
+        lastCheck = out;
+      } catch (e) {
+        out.error = (e && e.message) ? String(e.message) : String(e);
+      }
+      return out;
+    }
+
     // ------------------------------------------------------------ //
     // sparks: a few dozen at most, staggered, and only between nodes
     // that are fresh and on screen
     // ------------------------------------------------------------ //
-    var sparkQueue = [];
+    // A FIFO ring, preallocated once: a burst of new events must never make the
+    // frame loop allocate or splice an array.
+    var sparkQueue = new Array(SPARK_POOL * 4);
+    var sparkQHead = 0, sparkQCount = 0, sparkBursts = 0, sparkPointsWritten = 0;
     var lastSparkAt = 0;
+
+    function queuePush(item) {
+      if (sparkQCount >= sparkQueue.length) {
+        // the ring is full: drop the oldest, a burst must not grow it
+        sparkQHead = (sparkQHead + 1) % sparkQueue.length;
+        sparkQCount--;
+      }
+      sparkQueue[(sparkQHead + sparkQCount) % sparkQueue.length] = item;
+      sparkQCount++;
+    }
 
     function spawnSparks(indices) {
       if (!linkLines.visible) return 0;   // the links switch hides them too
@@ -712,8 +1377,8 @@ window.GRAFFRiver = (function () {
           if (linkList[l].to === idx) { parent = linkList[l]; break; }
         }
         if (!parent) continue;
-        sparkQueue.push({ link: parent, at: now });
-        if (sparkQueue.length > SPARK_POOL) sparkQueue.shift();
+        if (sparkQCount >= SPARK_POOL) break;   // the pool is what matters
+        queuePush({ link: parent, at: now });
       }
     }
 
@@ -741,22 +1406,25 @@ window.GRAFFRiver = (function () {
     }
 
     function updateSparks(now) {
-      // drain the queue with a stagger so a burst leaves one after another
-      var i;
-      for (i = 0; i < sparkQueue.length; i++) {
-        if (now - lastSparkAt >= SPARK_STAGGER_MS) {
-          launchSpark(sparkQueue[i], now);
-          lastSparkAt = now;
-          sparkQueue.splice(i, 1);
-          i--;
-        } else break;
+      // Drain the ring with a stagger so a burst leaves one after another.
+      // The drain is itself capped: a volley of new events must never cost
+      // more than a handful of sparks inside one frame.
+      var launched = 0;
+      while (sparkQCount && launched < SPARK_STAGGER_MAX && now - lastSparkAt >= SPARK_STAGGER_MS) {
+        launchSpark(sparkQueue[sparkQHead], now);
+        sparkQueue[sparkQHead] = null;
+        sparkQHead = (sparkQHead + 1) % sparkQueue.length;
+        sparkQCount--;
+        lastSparkAt = now;
+        launched++;
+        sparkBursts++;
       }
-      if (sparkQueue.length > SPARK_POOL * 4) sparkQueue = sparkQueue.slice(-SPARK_POOL * 2);
 
-      var write = 0;
-      for (i = 0; i < sparkPool.length; i++) {
+      var write = 0, liveActive = 0;
+      for (var i = 0; i < sparkPool.length; i++) {
         var s = sparkPool[i];
         if (!s.active) continue;
+        liveActive++;
         var t = (now - s.start) / s.dur;
         if (t >= 1) {
           s.active = false;
@@ -778,17 +1446,20 @@ window.GRAFFRiver = (function () {
           write++;
         }
       }
-      sparkGeo.attributes.position.needsUpdate = true;
-      sparkGeo.attributes.color.needsUpdate = true;
+      sparkPointsWritten = write;
+      // the sparks are the ONE buffer that legitimately moves every frame it
+      // is alive; when nothing is alive the flag is simply not set
+      if (liveActive) renderDirty |= DIRTY_SPARK;
+      return liveActive;
     }
 
     function clearSparks() {
-      sparkQueue = [];
+      sparkQHead = 0; sparkQCount = 0;
       for (var i = 0; i < sparkPool.length; i++) sparkPool[i].active = false;
       for (var k = 0; k < SPARK_POINTS; k++) {
         sparkPos[k * 3] = 1e7; sparkPos[k * 3 + 1] = 1e7; sparkPos[k * 3 + 2] = 1e7;
       }
-      sparkGeo.attributes.position.needsUpdate = true;
+      renderDirty |= DIRTY_SPARK;
     }
 
     // ------------------------------------------------------------ //
@@ -820,8 +1491,7 @@ window.GRAFFRiver = (function () {
       var span = Math.max(w, h * 1.6, d * 1.6);
       var r = Math.max(180, span / (2 * Math.tan(Math.PI / 8)));
       followTarget = null;
-      pendingFrame = true;
-      if (!document.hidden) start();
+      wake();
       animateTo(cx, cy, cz, Math.min(r, MAX_R), animate);
     }
 
@@ -831,6 +1501,7 @@ window.GRAFFRiver = (function () {
         target.set(x, y, z); radius = r; applyCamera(); return;
       }
       camAnim = { t0: nowMs(), dur: 600, fromT: { x: target.x, y: target.y, z: target.z, r: radius }, toT: { x: x, y: y, z: z, r: r } };
+      wake();
     }
 
     function tickCamera(now) {
@@ -865,15 +1536,34 @@ window.GRAFFRiver = (function () {
 
     function setPixelRatio(v) {
       if (!renderer) return;
-      try { renderer.setPixelRatio(v); } catch (e) {}
+      var d = Math.min(v || 1, MAX_DPR);
+      try { renderer.setPixelRatio(d); } catch (e) {}
+      if (linkMat.uniforms && linkMat.uniforms.uPx) {
+        linkMat.uniforms.uPx.value = LINK_PX * (1 + (d - 1) * 0.25);
+      }
+      wake();
+    }
+
+    // Thickness of the causal ribbon, in pixels.  WebGL ignores linewidth, so
+    // this really is a width the user can change: the ribbon is geometry.
+    function linkWidth(px) {
+      if (px === undefined) return linkMat.uniforms.uPx.value;
+      var v = Math.max(1, Math.min(12, Number(px) || LINK_PX));
+      try { localStorage.setItem("graff.river.linkPx", String(v)); } catch (e) {}
+      linkMat.uniforms.uPx.value = v * (1 + (linkDpr - 1) * 0.25);
+      wake();
+      return v;
     }
 
     function resize(w, h) {
-      pendingFrame = true;
+      wake();
       if (!renderer) return;
       camera.aspect = (w || 1) / (h || 1);
       camera.updateProjectionMatrix();
       renderer.setSize(w, h, false);
+      if (linkMat.uniforms && linkMat.uniforms.resolution) {
+        linkMat.uniforms.resolution.value.set(w || 1, h || 1);
+      }
     }
 
     // ------------------------------------------------------------ //
@@ -887,8 +1577,7 @@ window.GRAFFRiver = (function () {
     function setLinksVisible(on) {
       state_linksVisible = !!on;
       linkLines.visible = !!on && sceneLinks > 0;
-      pendingFrame = true;
-      if (!document.hidden) start();
+      wake();
       return linkLines.visible;
     }
 
@@ -906,8 +1595,7 @@ window.GRAFFRiver = (function () {
       var dur = Math.min(CREST_MAX_MS, Math.max(320, indices.length * CREST_MS_PER_NODE));
       crests.push({ indices: indices.slice(0, 400), start: nowMs(), dur: dur });
       if (crests.length > 4) crests.shift();
-      pendingFrame = true;
-      if (!document.hidden) start();
+      wake();
       return indices.length;
     }
 
@@ -919,7 +1607,7 @@ window.GRAFFRiver = (function () {
     var rafId = null;
     var lastNow = 0;
     var lastRecolour = 0;
-    var frameMs = 0;
+    var frameMs = 0, frameMsMax = 0, frameMsSum = 0, frameCount = 0;
     var drawCalls = 0;
     var triangles = 0;
     var animBudget = 0;      // ms the last animation pass took
@@ -928,7 +1616,40 @@ window.GRAFFRiver = (function () {
     var frames = 0;          // frames actually drawn
     var nonEmptyFrames = 0;  // frames drawn while the scene had nodes
     var lastFrameAt = 0;
-    var idle = false;         // nothing animating: the loop is on a slow tick
+    var idle = false;         // nothing is animating right now
+    var idleSince = 0;        // when the scene last went quiet
+    var idleGap = 0;          // ms we have been quiet
+    var coolSettled = false;  // every colour has reached its final bucket
+    var coolQuiet = 0;        // consecutive recolour ticks that changed nothing
+    // Re-uploads/second, measured over a rolling window.  The ring is
+    // preallocated: measuring the scene must not itself allocate.
+    var ringAt = new Float64Array(UPLOAD_RING);
+    var ringN = new Float64Array(UPLOAD_RING);
+    var ringHead = 0, ringCount = 0;
+    var uploadedMatrix = 0, uploadedColour = 0, uploadsSparks = 0, uploadsLinks = 0, uploadsLinkColor = 0;
+    var uploadedMatrixElems = 0, uploadedColourElems = 0;   // instance slots uploaded
+    var uploadedLinkGeometry = 0;
+    var uploadsPerSecond = 0;
+    var firstColourUpload = true;   // the colour buffer needs one full push
+
+    // One entry per upload burst, so the rate reads "bursts per second".
+    function noteUpload(n, now) {
+      ringAt[ringHead] = now; ringN[ringHead] = n;
+      ringHead = (ringHead + 1) % UPLOAD_RING;
+      if (ringCount < UPLOAD_RING) ringCount++;
+      uploadRate(now);
+    }
+
+    // Read on demand, so the figure decays to zero by itself once the scene
+    // has parked - it must never report a stale "bursts per second".
+    function uploadRate(now) {
+      var fresh = 0;
+      for (var i = 0; i < ringCount; i++) {
+        if (now - ringAt[i] <= UPLOAD_WINDOW_MS) fresh += ringN[i];
+      }
+      uploadsPerSecond = fresh;
+      return fresh;
+    }
 
     function nowMs() {
       return (window.performance && window.performance.now) ? window.performance.now() : Date.now();
@@ -940,7 +1661,10 @@ window.GRAFFRiver = (function () {
       // A node that was never written would be invisible (zero matrix), so the
       // very first frame after a data change fills in every missing instance.
       ensureMatrices(now);
-      // animation budget: only fresh nodes get per-frame work
+      pendingFrame = false;
+
+      // ---- animated pass: only the nodes that are actually moving -------- //
+      passDirty = DIRTY_MATRIX | DIRTY_COLOR;
       var i;
       for (i = 0; i < active.length; i++) {
         var idx = active[i];
@@ -954,30 +1678,81 @@ window.GRAFFRiver = (function () {
           if (cr.indices[k] < sceneNodes) setNodeAppearance(cr.indices[k], now);
         }
       }
-      if (now - lastRecolour > RECOLOUR_MS) { lastRecolour = now; recolour(now); }
-      cores.instanceMatrix.needsUpdate = true;
-      if (cores.instanceColor) cores.instanceColor.needsUpdate = true;
-      halos.geometry.attributes.position.needsUpdate = true;
-      halos.geometry.attributes.color.needsUpdate = true;
-      linkGeo.attributes.position.needsUpdate = true;
-      linkGeo.attributes.color.needsUpdate = true;
-      sparkGeo.attributes.position.needsUpdate = true;
-      sparkGeo.attributes.color.needsUpdate = true;
+      // ---- cooling pass: batched on a timer, never per frame.  It is the only
+      // thing left to do once every node has arrived, and it stops for good as
+      // soon as the whole palette has settled. ------------------------------ //
+      if (now - lastRecolour > RECOLOUR_MS) {
+        lastRecolour = now;
+        passDirty = DIRTY_MATRIX | DIRTY_COLOR;
+        var changed = recolour(now);
+        if (changed) coolQuiet = 0;
+        else if (++coolQuiet >= 3) coolSettled = true;   // nothing will change
+      }
+      passDirty = DIRTY_MATRIX | DIRTY_COLOR;
+      flushDirty();
       animBudget = nowMs() - t0;
       pendingFrame = false;
 
       if (renderer) {
+        if (linkWindingOk === null && sceneLinks > 0) windingTest();
         renderer.render(scene, camera);
         try {
           var info = renderer.info.render;
           drawCalls = info.calls || 0;
           triangles = info.triangles || 0;
         } catch (e) {}
+        var ms = nowMs() - t0;                  // CPU cost of the JS pass
+        if (ms > frameMsMax) frameMsMax = ms;   // absolute worst pass seen
+        frameMsSum += ms;
+        frameCount++;
         frames++;
         if (sceneNodes > 0) nonEmptyFrames++;
         lastFrameAt = nowMs();
       }
       return !!renderer;
+    }
+
+    // Push exactly the buffers that changed since the last frame.  An idle or
+    // merely rotating frame therefore uploads NOTHING at all: the instances
+    // already live on the GPU and the camera is a uniform, not a buffer.
+    function flushDirty() {
+      var d = renderDirty;
+      renderDirty = 0;
+      if (!d) return;
+      var iMin = dirtyMin, iMax = dirtyMax;
+      dirtyMin = -1; dirtyMax = -1;
+      noteUpload(1, nowMs());
+      var span = (iMin >= 0 && iMax >= iMin) ? (iMax - iMin + 1) : 0;
+      // The FIRST push of a buffer must cover the whole buffer: a partial range
+      // only updates a buffer that already holds valid data, and an instance
+      // whose slot was never pushed would draw from a fresh (zero) buffer.
+      var ranged = span > 0 && span < sceneNodes && !firstColourUpload;
+      if (d & DIRTY_COLOR && firstColourUpload) firstColourUpload = false;
+      if (d & DIRTY_MATRIX) {
+        if (cores.instanceMatrix) {
+          cores.instanceMatrix.updateRange = ranged
+            ? { offset: iMin * 16, count: span * 16 } : { offset: 0, count: -1 };
+          cores.instanceMatrix.needsUpdate = true;
+          uploadedMatrix++;
+          uploadedMatrixElems += (ranged ? span : sceneNodes);
+        }
+      }
+      if (d & DIRTY_COLOR) {
+        if (cores.instanceColor) {
+          cores.instanceColor.updateRange = ranged
+            ? { offset: iMin * 3, count: span * 3 } : { offset: 0, count: -1 };
+          cores.instanceColor.needsUpdate = true;
+          uploadedColour++;
+          uploadedColourElems += (ranged ? span : sceneNodes);
+        }
+      }
+      if (d & DIRTY_LINK) { if (linkGeo.attributes.position) linkGeo.attributes.position.needsUpdate = true; uploadsLinks++; }
+      if (d & DIRTY_LINKCOLOR) { if (linkGeo.attributes.color) linkGeo.attributes.color.needsUpdate = true; uploadsLinkColor++; }
+      if (d & DIRTY_SPARK) {
+        if (sparkGeo.attributes.position) sparkGeo.attributes.position.needsUpdate = true;
+        if (sparkGeo.attributes.color) sparkGeo.attributes.color.needsUpdate = true;
+        uploadsSparks++;
+      }
     }
 
     function pruneActive(now) {
@@ -1004,44 +1779,77 @@ window.GRAFFRiver = (function () {
 
     // Is there anything that really needs a 60 Hz frame right now?
     function hasWork(now) {
-      if (loopDirty || pendingFrame || camAnim) return true;
+      if (camAnim || pendingFrame) return true;
       if (active.length) return true;
+      // cooling counts as work while it still changes something, and stops
+      // entirely once the palette has settled
+      if (!coolSettled && sceneNodes && now - lastRecolour > RECOLOUR_MS) return true;
       for (var c = 0; c < crests.length; c++) if (now - crests[c].start <= crests[c].dur) return true;
       for (var s = 0; s < sparkPool.length; s++) if (sparkPool[s].active) return true;
       return false;
     }
 
+    // Once the scene is quiet the loop parks itself: it stops asking for
+    // animation frames altogether and leaves the last correct frame on screen.
+    // The mode stays live because every producer (new data, a spark, a crest,
+    // the camera, a resize) wakes it again.
+    function park() {
+      // NOTE: `running` stays true on purpose.  A parked river is still a live
+      // mode - it resumes on the next wake() - it has merely stopped asking for
+      // animation frames.  Only stop() (leaving the mode) sets running = false.
+      if (rafId !== null) { cancelAnimationFrame(rafId); rafId = null; }
+      if (idleSince) idleGap = nowMs() - idleSince;
+    }
+
     function loop() {
       rafId = requestAnimationFrame(loop);
-      if (isPaused()) return;
+      if (isPaused()) { idle = true; return; }
       var now = nowMs();
       var dt = lastNow ? (now - lastNow) : 16;
       lastNow = now;
-      var work = hasWork(now);
-      // Nothing is animating: drop to a slow tick instead of stopping.  The
-      // canvas stays correct, cooling keeps running and the mode stays "live",
-      // but no frame budget is burnt on an idle scene.
-      if (!work) {
-        idle = true;
-        if (now - lastFrameAt < IDLE_MS) return;
-      } else {
-        idle = false;
+      if (hasWork(now)) {
+        // "frameMs" is the wall-clock gap between frames: that, not the CPU
+        // cost of the JS pass, is what a user feels as smoothness.
+        frameMs = frameMs ? (frameMs * 0.8 + dt * 0.2) : dt;
+        idle = false; idleSince = 0; idleGap = 0;
+        tickCamera(now);
+        updateSparks(now);
+        renderOnce(now);
+        pruneActive(now);
+        return;
       }
-      frameMs = frameMs ? (frameMs * 0.8 + dt * 0.2) : dt;
-      tickCamera(now);
-      updateSparks(now);
-      renderOnce(now);
-      pruneActive(now);
-      loopDirty = false;
+      // Nothing to animate.  A live session usually keeps arriving, so linger
+      // for a short grace window on a slow tick; after that the loop parks for
+      // real and stops asking for frames.  The last correct frame stays on
+      // screen, and every producer wakes the loop again.
+      idle = true;
+      if (!idleSince) { idleSince = now; return; }
+      if (now - idleSince < IDLE_MS) {
+        if (now - lastFrameAt >= IDLE_TICK_MS) {
+          tickCamera(now);
+          updateSparks(now);
+          renderOnce(now);
+          pruneActive(now);
+        }
+        return;
+      }
+      idleGap = now - idleSince;
+      // a parked loop may never leave a stale frame behind
+      if (pendingFrame) renderOnce(now);
+      park();
     }
 
     function start() {
       pendingFrame = true;
-      if (running) return;
+      idle = false; idleSince = 0; idleGap = 0;
       running = true;
+      // A parked loop has running === true and rafId === null; that is exactly
+      // the state start() must revive, so the gate is the pending frame, not
+      // the `running` flag.
+      if (rafId !== null) return;
       lastNow = 0;
       loopDirty = true;
-      if (rafId === null) rafId = requestAnimationFrame(loop);
+      rafId = requestAnimationFrame(loop);
     }
 
     // `stop()` is allowed to park the loop, but never on a canvas that does not
@@ -1054,8 +1862,6 @@ window.GRAFFRiver = (function () {
       if (drawFinal !== false && pendingFrame && !document.hidden) renderOnce(nowMs());
     }
 
-    // Force exactly one frame.  Used by the diagnostics surface so a check can
-    // prove from outside that the scene really paints.
     function renderNow() {
       var drew = renderOnce(nowMs());
       pendingFrame = false;
@@ -1063,7 +1869,6 @@ window.GRAFFRiver = (function () {
     }
 
     function wake(ms) {
-      loopDirty = true;
       start();
       if (ms) {
         setTimeout(function () { loopDirty = true; start(); }, ms);
@@ -1075,16 +1880,15 @@ window.GRAFFRiver = (function () {
     // picking: project the node positions and take the nearest one
     // (no DOM hit-testing, no per-node elements)
     // ------------------------------------------------------------ //
-    var projVec = new THREE_.Vector3();
+    // Picking allocates nothing either: it reuses the frame-loop scratch.
     function pick(clientX, clientY, w, h) {
       if (!sceneNodes) return null;
       var best = null, bestD = 24 * 24;
       for (var i = 0; i < sceneNodes; i++) {
         var n = nodeList[i];
-        projVec.set(n.x, n.y, n.z);
-        projVec.project(camera);
-        var sx = (projVec.x * 0.5 + 0.5) * w;
-        var sy = (-projVec.y * 0.5 + 0.5) * h;
+        tmpVec.set(n.x, n.y, n.z).project(camera);
+        var sx = (tmpVec.x * 0.5 + 0.5) * w;
+        var sy = (-tmpVec.y * 0.5 + 0.5) * h;
         var d = (sx - clientX) * (sx - clientX) + (sy - clientY) * (sy - clientY);
         if (d < bestD) { bestD = d; best = n; }
       }
@@ -1092,21 +1896,72 @@ window.GRAFFRiver = (function () {
     }
 
     function stats() {
+      var r = function (v) { return Math.round(v * 100) / 100; };
       return {
         nodes: sceneNodes, links: sceneLinks,
         drawCalls: drawCalls, triangles: triangles,
         frameMs: Math.round(frameMs * 10) / 10,
+        frameMsMax: Math.round(frameMsMax * 10) / 10,
+        frameMsAvg: frameCount ? Math.round((frameMsSum / frameCount) * 100) / 100 : 0,
         fps: frameMs > 0 ? Math.round(1000 / frameMs) : 0,
-        running: running, animBudget: Math.round(animBudget * 100) / 100,
+        running: running, animBudget: r(animBudget),
         // proof that the canvas is not black: frames really drawn, and whether
         // any of them was drawn with the graph populated
         frames: frames, nonEmptyFrames: nonEmptyFrames,
         drawn: frames > 0, painted: nonEmptyFrames > 0,
         pendingFrame: pendingFrame,
+        // A parked loop is still a LIVE mode: `running` stays true and it wakes
+        // on the next update.  `scheduled` is the honest "is a frame actually
+        // queued right now" figure the perf check reads.
+        scheduled: rafId !== null,
         idle: idle,
         idleMs: IDLE_MS,
+        idleGap: Math.round(idleGap), coolSettled: coolSettled,
         lastFrameAgo: lastFrameAt ? Math.round(nowMs() - lastFrameAt) : null,
-        sparkLimit: SPARK_POOL, bandCap: BAND_CAP, maxNodes: MAX_NODES
+        // the effect of the whole exercise, in numbers:
+        uploadsPerSecond: uploadRate(nowMs()),
+        uploadMatrix: uploadedMatrix, uploadColour: uploadedColour,
+        uploadSparks: uploadsSparks, uploadLinks: uploadsLinks,
+        uploadLinkGeometry: uploadedLinkGeometry,
+        uploadMatrixElems: uploadedMatrixElems, uploadColourElems: uploadedColourElems,
+        writtenNodes: writtenNodes, writtenLinks: writtenLinks,
+        sparkLimit: SPARK_POOL, bandCap: BAND_CAP, maxNodes: MAX_NODES,
+        sparkStaggerMax: SPARK_STAGGER_MAX, recolourBatch: RECOLOUR_BATCH,
+        linkPx: LINK_PX,
+        haloCount: halos ? halos.count : 0,
+        haloGrow: HALO_GROW,
+        haloOpacity: haloMat.opacity,
+        coreSegments: CORE_SEG_W + "x" + CORE_SEG_H,
+        sparkPointsWritten: sparkPointsWritten,
+        // The honest view of the canvas.  `checkDone` false means selfCheck()
+        // has never run; the app shows a dash instead of inventing a number.
+        danglingLinks: dangling,
+        warnings: warnings,
+        lastWarning: lastWarning,
+        linkWinding: linkWindingOk,
+        checkDone: !!lastCheck,
+        checkSupported: !!(lastCheck && lastCheck.supported),
+        checkNonBlack: lastCheck ? lastCheck.nonBlack : 0,
+        checkHues: lastCheck ? lastCheck.hues : 0,
+        checkLines: lastCheck ? lastCheck.linePixels : 0,
+        checkNodes: lastCheck ? lastCheck.nodesInFrame : 0,
+        checkSize: lastCheck ? (lastCheck.width + "x" + lastCheck.height) : "",
+        checkError: lastCheck && lastCheck.error ? lastCheck.error : null
+      };
+    }
+
+    // A test/DI surface for the park-and-paint invariant: how many frames were
+    // drawn and skipped while the loop was parked, plus the counters above.
+    function perfCounters() {
+      return {
+        frames: frames, uploadsPerSecond: uploadRate(nowMs()),
+        uploadMatrix: uploadedMatrix, uploadColour: uploadedColour,
+        uploadSparks: uploadsSparks, uploadLinks: uploadsLinks,
+        uploadLinkGeometry: uploadedLinkGeometry,
+        uploadMatrixElems: uploadedMatrixElems, uploadColourElems: uploadedColourElems,
+        sparkBursts: sparkBursts, writtenNodes: writtenNodes, writtenLinks: writtenLinks,
+        running: running, scheduled: rafId !== null,
+        idleGap: Math.round(idleGap)
       };
     }
 
@@ -1136,12 +1991,12 @@ window.GRAFFRiver = (function () {
         }
       } catch (e) {}
       try { cores.geometry.dispose(); coreMat.dispose(); } catch (e) {}
-      try { haloGeo.dispose(); haloMat.dispose(); } catch (e) {}
+      try { halos.geometry.dispose(); haloMat.dispose(); } catch (e) {}
       try { linkGeo.dispose(); linkMat.dispose(); } catch (e) {}
       try { sparkGeo.dispose(); sparkMat.dispose(); } catch (e) {}
       if (renderer && renderer.dispose) { try { renderer.dispose(); } catch (e) {} }
       renderer = null;
-      nodeList = []; indexOfId = {}; linkList = []; sceneNodes = 0; sceneLinks = 0;
+      nodeList = []; indexOfId = newIdMap(); linkList = []; sceneNodes = 0; sceneLinks = 0;
     }
 
     // ------------------------------------------------------------ //
@@ -1173,6 +2028,12 @@ window.GRAFFRiver = (function () {
       stop: stop,
       wake: wake,
       renderOnce: renderNow,
+      selfCheck: selfCheck,
+      windingTest: windingTest,
+      setWarnHandler: function (fn) { warnHandler = fn; },
+      perfCounters: perfCounters,
+      colourTable: function () { return colourTable; },
+      linkWidth: linkWidth,
       ensureMatrices: ensureMatrices,
       writtenInstances: function () {
         var n = 0;

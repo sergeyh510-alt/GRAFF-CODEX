@@ -185,6 +185,13 @@
         <input type="checkbox" id="river-links" checked />
         <span>Связи (градиент от причины к следствию)</span>
       </label>
+      <label class="field">
+        <span>Толщина связей, px</span>
+        <div class="range-row">
+          <input type="range" id="river-link-px" min="1" max="8" step="0.5" value="3" />
+          <output id="river-link-px-value">3</output>
+        </div>
+      </label>
       <div class="button-row">
         <button id="btn-river-fit" class="btn">Уместить всё</button>
         <button id="btn-river-latest" class="btn">К последнему</button>
@@ -195,10 +202,18 @@
         <div class="diag-row"><span class="diag-key">узлов / связей</span><span class="diag-val" id="river-counts">—</span></div>
         <div class="diag-row"><span class="diag-key">свёрнуто в группы</span><span class="diag-val" id="river-groups">—</span></div>
         <div class="diag-row"><span class="diag-key">FPS</span><span class="diag-val" id="river-fps">—</span></div>
-        <div class="diag-row"><span class="diag-key">кадр</span><span class="diag-val" id="river-frame">—</span></div>
+        <div class="diag-row"><span class="diag-key">кадр (сред / макс)</span><span class="diag-val" id="river-frame">—</span></div>
+        <div class="diag-row"><span class="diag-key">перезаливок буферов/с</span><span class="diag-val" id="river-uploads">—</span></div>
+        <div class="diag-row"><span class="diag-key">простой</span><span class="diag-val" id="river-idle">—</span></div>
         <div class="diag-row"><span class="diag-key">draw calls</span><span class="diag-val" id="river-calls">—</span></div>
         <div class="diag-row"><span class="diag-key">треугольников</span><span class="diag-val" id="river-tris">—</span></div>
         <div class="diag-row"><span class="diag-key">искр (живых/пул)</span><span class="diag-val" id="river-sparks">—</span></div>
+        <div class="diag-row"><span class="diag-key">проверка картинки</span><span class="diag-val" id="river-check">—</span></div>
+        <div class="diag-row"><span class="diag-key">висячих связей</span><span class="diag-val" id="river-dangling">—</span></div>
+        <div class="diag-row"><span class="diag-key">предупреждений данных</span><span class="diag-val" id="river-warn">—</span></div>
+      </div>
+      <div class="button-row">
+        <button id="btn-river-check" class="btn">Самопроверка</button>
       </div>
     </section>
 

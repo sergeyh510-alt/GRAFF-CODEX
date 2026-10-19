@@ -114,14 +114,19 @@
   var ws = null;
   var reconnectTimer = null;
 
-  var rawNodes = {};             // id -> server node object
+  // Every id-keyed map is NULL-PROTOTYPE: an id such as "constructor" or
+  // "toString" must read back as "absent" instead of returning an inherited
+  // Object.prototype member.  A plain {} let such an id pass a `=== undefined`
+  // guard, which is exactly how an undefined node reached the river scene.
+  function idMap() { return Object.create(null); }
+  var rawNodes = idMap();         // id -> server node object
   var rawOrder = [];             // insertion order of ids
-  var childrenOf = {};           // id -> [child ids]
+  var childrenOf = idMap();      // id -> [child ids]
   var edgeList = [];             // server edge objects
-  var edgeIds = {};              // "from>to" -> true
+  var edgeIds = idMap();         // "from>to" -> true
   var positions = {};            // id -> {x,y} for minimap
-  var viewMap = {};              // rendered id -> raw id
-  var viewMapReverse = {};       // raw id -> rendered id
+  var viewMap = idMap();         // rendered id -> raw id
+  var viewMapReverse = idMap();  // raw id -> rendered id
 
   var autoMode = null;           // "lanes" when auto-selected for degenerate graphs
 
@@ -154,7 +159,8 @@
     laneShifts: {},       // 2D lanes: manual per-node horizontal offsets (id -> dx)
     riverCollapse: true,  // river: fold routine repeats into "xN" groups
     riverFollow: true,    // river: camera follows the newest node
-    riverLinks: true      // river: draw the causal links
+    riverLinks: true,     // river: draw the causal links
+    riverLinkPx: 3        // river: ribbon thickness in px (WebGL ignores linewidth)
   };
 
   var status = { startedWall: Date.now(), counts: {} };
@@ -245,8 +251,8 @@
   // ------------------------------------------------------------------ //
   function buildView() {
     var items = [];
-    var groups = {};
-    var dropped = {};
+    var groups = idMap();
+    var dropped = idMap();
 
     if (state.collapse) {
       for (var i = 0; i < rawOrder.length; i++) {
@@ -277,8 +283,8 @@
       }
     }
 
-    viewMap = {};
-    viewMapReverse = {};
+    viewMap = idMap();
+    viewMapReverse = idMap();
     for (var m = 0; m < items.length; m++) {
       viewMap[items[m].id] = items[m].source.id;
       viewMapReverse[items[m].source.id] = items[m].id;
@@ -568,7 +574,7 @@
   }
 
   function rebuildIndexes() {
-    childrenOf = {};
+    childrenOf = idMap();
     for (var i = 0; i < rawOrder.length; i++) {
       var raw = rawNodes[rawOrder[i]];
       if (!raw || !raw.parent) continue;
@@ -917,10 +923,10 @@
   // live ingestion
   // ------------------------------------------------------------------ //
   function ingestInit(message) {
-    rawNodes = {};
+    rawNodes = idMap();
     rawOrder = [];
     edgeList = [];
-    edgeIds = {};
+    edgeIds = idMap();
     state.selected = null;
     state.matches = null;
     state.pathNodes = null;
@@ -2371,7 +2377,11 @@
       if (river) return river;
       var host = $("river3d");
       if (!host) throw new Error("нет контейнера #river3d");
-      river = window.GRAFFRiver.create(host, { perf: state.perf });
+      river = window.GRAFFRiver.create(host, {
+        perf: state.perf,
+        // a malformed record must surface in the journal, never vanish
+        onWarn: function (msg) { pushLog("\u2022 " + msg); }
+      });
       buildRiverLegend();
       return river;
     });
@@ -2384,7 +2394,7 @@
   }
 
   function riverNodeIds(items) {
-    var ids = {};
+    var ids = idMap();
     for (var i = 0; i < items.length; i++) ids[items[i].id] = true;
     return ids;
   }
@@ -2398,6 +2408,20 @@
 
   var lastRiverAt = 0;
   var lastRiverSig = null;
+  // Data problems of the derived view reach the journal, not just a counter: the
+  // river scene reports its OWN dangling links and this reports the edges that
+  // were dropped before the scene ever saw them.  Only a MISSING endpoint counts
+  // as a problem: an edge between two events of the same rolled-up group
+  // collapses to a self-edge on purpose, and that is not a fault.  Reported once
+  // per distinct number, so a filtered session writes one line per change.
+  var lastLinkWarn = -1;
+  function reportDangling(missing) {
+    if (missing === lastLinkWarn) return;
+    lastLinkWarn = missing;
+    if (missing > 0) {
+      pushLog("\u2022 русло: пропущено связей без узла в виде — " + missing);
+    }
+  }
 
   function syncRiver(force) {
     if (!river || state.mode !== "river") return;
@@ -2419,18 +2443,21 @@
     if (source.length > RIVER_MAX_NODES) capped = source.slice(source.length - RIVER_MAX_NODES);
 
     var m = window.GRAFFRiver.layout(capped, state.riverCollapse);
-    var byRaw = {};
+    var byRaw = idMap();
     for (var k = 0; k < m.nodes.length; k++) {
       var ids = m.nodes[k].rawIds;
       for (var r = 0; r < ids.length; r++) byRaw[ids[r]] = m.nodes[k];
     }
     var links = [];
+    var missingEnds = 0;
     if (state.riverLinks) {
       for (var e = 0; e < edgeList.length; e++) {
         var ends = riverLinkEnds(edgeList[e], byRaw);
         if (ends) links.push(ends);
+        else if (!byRaw[edgeList[e].from] || !byRaw[edgeList[e].to]) missingEnds++;
       }
     }
+    reportDangling(missingEnds);
 
     var sig = m.nodes.length + ":" + links.length + ":" +
       (m.nodes.length ? m.nodes[m.nodes.length - 1].id : "") + ":" + (state.riverLinks ? 1 : 0);
@@ -2502,13 +2529,38 @@
     setText("river-counts", st.nodes + " / " + st.links);
     setText("river-groups", grouped + " групп");
     setText("river-fps", st.fps ? ("~" + st.fps) : "—");
-    setText("river-frame", st.frameMs ? (st.frameMs + " мс") : "—");
+    setText("river-frame", (st.frameMs ? (st.frameMs + " мс") : "—") +
+      (st.frameMsMax ? (" / " + st.frameMsMax + " мс") : ""));
+    setText("river-uploads", String(st.uploadsPerSecond || 0));
+    setText("river-idle", st.running
+      ? (st.idle ? ("простой " + Math.round((st.idleGap || 0) / 1000) + " с") : "анимация")
+      : "остановлен на кадре");
     setText("river-calls", String(st.drawCalls));
     setText("river-tris", fmtInt(st.triangles));
     setText("river-mode", "Русло · поток времени");
     var liveSparks = 0;
     if (river && river.sparkStats) liveSparks = river.sparkStats();
     setText("river-sparks", liveSparks + " / " + (window.GRAFFRiver ? window.GRAFFRiver.constants.SPARK_POOL : 0));
+    // The pixel self-check is the only number that proves the canvas is not a
+    // grey smear: counters and draw calls can all look healthy while the screen
+    // is empty, which is exactly how the last regression slipped through.
+    if (st.checkDone) {
+      var bits = [
+        fmtInt(st.checkNonBlack) + " пикс",
+        st.checkHues + " оттенков",
+        (st.checkLines > 0 ? "линии да" : "линии нет"),
+        st.checkNodes + " узлов в кадре"
+      ];
+      if (st.checkError) bits.push("ошибка: " + st.checkError);
+      if (st.linkWinding === false) bits.push("квад не рисуется!");
+      setText("river-check", bits.join(" · "));
+    } else {
+      setText("river-check", "нажмите «Самопроверка»");
+    }
+    setText("river-dangling", String(st.danglingLinks || 0));
+    setText("river-warn", st.warnings
+      ? (st.warnings + (st.lastWarning ? (" \u00b7 " + st.lastWarning) : ""))
+      : "нет");
     var note = $("river-note");
     if (note) {
       var raw = rawOrder.length;
@@ -2552,6 +2604,7 @@
     if (!river) return;
     river.setPixelRatio(state.perf ? 1 : (window.devicePixelRatio || 1));
     if (river.setLinksVisible) river.setLinksVisible(!!state.riverLinks);
+    if (river.linkWidth) river.linkWidth(state.riverLinkPx);
   }
 
   function riverFollowIfWanted() {
@@ -2728,7 +2781,8 @@
         laneShifts: state.laneShifts,
         riverCollapse: state.riverCollapse,
         riverFollow: state.riverFollow,
-        riverLinks: state.riverLinks
+        riverLinks: state.riverLinks,
+        riverLinkPx: state.riverLinkPx
       }));
     } catch (e) { /* storage disabled */ }
   }
@@ -2765,6 +2819,7 @@
     if (typeof p.perf === "boolean") state.perf = p.perf;
     if (typeof p.followSessions === "boolean") state.followSessions = p.followSessions;
     if (typeof p.linkWidth === "boolean") state.linkWidth = p.linkWidth;
+    if (typeof p.riverLinkPx === "number") state.riverLinkPx = Math.max(1, Math.min(8, p.riverLinkPx));
     if (typeof p.linkCurve === "boolean") state.linkCurve = p.linkCurve;
     if (typeof p.markers === "boolean") state.markers = p.markers;
     if (typeof p.riverCollapse === "boolean") state.riverCollapse = p.riverCollapse;
@@ -2801,6 +2856,8 @@
     set("river-collapse", state.riverCollapse);
     set("river-follow", state.riverFollow);
     set("river-links", state.riverLinks);
+    set("river-link-px", state.riverLinkPx);
+    setText("river-link-px-value", String(state.riverLinkPx));
     var slider = $("time-window");
     if (slider) {
       var idx = 0;
@@ -3037,7 +3094,19 @@
       if (state.mode === "river") { syncRiver(true); applyRiverPrefs(); }
       savePrefs();
     });
+    if ($("river-link-px")) $("river-link-px").addEventListener("input", function (e) {
+      state.riverLinkPx = Number(e.target.value) || 3;
+      setText("river-link-px-value", String(state.riverLinkPx));
+      if (river && river.linkWidth) river.linkWidth(state.riverLinkPx);   // wakes the loop
+      savePrefs();
+    });
     if ($("btn-river-fit")) $("btn-river-fit").addEventListener("click", riverFit);
+  if ($("btn-river-check")) $("btn-river-check").addEventListener("click", function () {
+    if (!river || !river.selfCheck) return;
+    river.selfCheck();
+    renderRiverDiag();
+    toast("Самопроверка «Русло»: " + ($("river-check") ? $("river-check").textContent : ""));
+  });
     if ($("btn-river-latest")) $("btn-river-latest").addEventListener("click", function () {
       if (state.mode !== "river") return;
       if (state.lastNodeId) riverFocus(viewMapReverse[state.lastNodeId] || state.lastNodeId);
@@ -3300,6 +3369,8 @@
       build: function () { return ensureRiver().then(function () { return true; }); },
       sync: function () { syncRiver(true); renderRiverDiag(); return !!river; },
       stats: function () { return (river && river.stats) ? river.stats() : null; },
+      selfCheck: function () { return (river && river.selfCheck) ? river.selfCheck() : null; },
+      perf: function () { return (river && river.perfCounters) ? river.perfCounters() : null; },
       // force exactly one frame from outside (diagnostics / automated checks)
       renderOnce: function () { return (river && river.renderOnce) ? river.renderOnce() : false; },
       written: function () { return (river && river.writtenInstances) ? river.writtenInstances() : 0; },
